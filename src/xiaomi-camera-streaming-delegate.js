@@ -1149,9 +1149,20 @@ class XiaomiCameraStreamingDelegate {
     if (this.snapshotCache?.buffer) {
       const refreshInterval = this.config.snapshotRefreshIntervalMs ?? 10000;
       if (now - this.snapshotCache.createdAt >= refreshInterval) {
+        this.refreshSnapshotFromPrebuffer(request).catch((error) => {
+          this.platform.log.debug(`Could not refresh Mijia snapshot from prebuffer: ${error.message}`);
+        });
         this.scheduleLocalSnapshotRefresh(request);
       }
       return this.snapshotCache.buffer;
+    }
+
+    const prebufferSnapshot = await this.refreshSnapshotFromPrebuffer(request).catch((error) => {
+      this.platform.log.debug(`Could not create first Mijia snapshot from prebuffer: ${error.message}`);
+      return null;
+    });
+    if (prebufferSnapshot) {
+      return prebufferSnapshot;
     }
 
     this.scheduleLocalSnapshotRefresh(request);
@@ -1191,6 +1202,29 @@ class XiaomiCameraStreamingDelegate {
       .finally(() => {
         this.snapshotInFlight = null;
       });
+  }
+
+  async refreshSnapshotFromPrebuffer(request) {
+    const quality = this.videoQualityForPurpose("snapshot");
+    const packets = this.getVideoPrebufferPackets({
+      videoQuality: quality,
+      allowMixedQuality: true,
+    });
+    if (!packets.length) {
+      return null;
+    }
+
+    const timeoutMs = Math.max(Number(this.config.snapshotPrebufferTimeoutMs || 4000), 1000);
+    const buffer = await withTimeout(
+      this.captureStillFrameFromPackets(packets, request),
+      timeoutMs,
+      `Snapshot prebuffer capture timed out after ${timeoutMs}ms.`,
+    );
+    this.snapshotCache = {
+      buffer,
+      createdAt: Date.now(),
+    };
+    return buffer;
   }
 
   async refreshLocalSnapshot(request) {

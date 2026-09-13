@@ -1,6 +1,6 @@
 {
   "name": "homebridge-mijia-v3",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "displayName": "Xiaomi 1080p",
   "description": "Experimental Homebridge camera plugin for Xiaomi/Mijia cameras using local MISS/TUTK media.",
   "main": "src/index.js",
