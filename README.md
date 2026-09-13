@@ -56,7 +56,7 @@ Current direction:
 }
 ```
 
-The compact configuration intentionally omits stream tuning. Safe defaults for `mijia.camera.v3` provide MAIN `superhd`, SUB `sd`, 720p HomeKit output, camera audio, SUB-based still/motion monitoring, and five concurrent HomeKit consumers. Continuous MAIN prebuffering is off by default to avoid keeping an extra high-bitrate camera session open.
+The compact configuration intentionally omits stream tuning. Safe defaults for `mijia.camera.v3` provide MAIN `superhd`, SUB `sd`, 720p HomeKit output, camera audio, SUB-based still/motion monitoring, and five concurrent HomeKit consumers. Continuous MAIN prebuffering is off by default to avoid keeping an extra high-bitrate camera session open. The default video-analysis motion threshold is intentionally conservative to reduce night/IR noise false positives.
 
 `cloudBootstrap: "fallback"` keeps normal camera operation local and reads the cached descriptor from `/homebridge/.xiaomi-1080p/miss-descriptors.json`. If that descriptor is missing, the plugin uses the cached Xiaomi session once to refresh it. After the descriptor exists, you can set `cloudBootstrap: "local"` for strict offline startup.
 

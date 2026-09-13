@@ -33,7 +33,7 @@ const CAMERA_DEFAULTS = Object.freeze({
     motionAnalysisDifference: 5,
     motionAnalysisFps: 2,
     motionAnalysisHeight: 90,
-    motionAnalysisSensitivity: 75,
+    motionAnalysisSensitivity: 55,
     motionAnalysisWidth: 160,
     motionAnalysisWarmupFrames: 4,
     motionAnalysisEventIntervalMs: 2000,
