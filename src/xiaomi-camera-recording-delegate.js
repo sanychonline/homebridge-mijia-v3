@@ -20,6 +20,8 @@ class XiaomiCameraRecordingDelegate {
     this.motionService = null;
     this.autoTriggerDone = false;
     this.autoTriggerAttempts = 0;
+    this.lastNotReadyLogAt = 0;
+    this.lastNotReadyState = "";
     this.lastRecordingStreamRequestedAt = 0;
     this.lastRecordingStream = null;
     this.completedStreams = new Map();
@@ -125,7 +127,7 @@ class XiaomiCameraRecordingDelegate {
     }
 
     if (!this.recordingActive || !this.recordingConfiguration) {
-      this.platform.log.warn(`Cannot trigger Mijia HSV recording for ${this.config.name || this.config.did}: recordingActive=${this.recordingActive}, hasRecordingConfiguration=${Boolean(this.recordingConfiguration)}.`);
+      this.logRecordingNotReady();
       return {
         ok: false,
         error: "recording-not-ready",
@@ -144,6 +146,22 @@ class XiaomiCameraRecordingDelegate {
       durationMs: timeoutMs,
       motion: this.motionEventManager.getStatusSnapshot(),
     };
+  }
+
+  logRecordingNotReady() {
+    const state = `recordingActive=${this.recordingActive},hasRecordingConfiguration=${Boolean(this.recordingConfiguration)}`;
+    const now = Date.now();
+    const throttleMs = Math.max(Number(this.config.hsvNotReadyLogIntervalMs || 60000), 5000);
+    if (state === this.lastNotReadyState && now - this.lastNotReadyLogAt < throttleMs) {
+      return;
+    }
+    this.lastNotReadyState = state;
+    this.lastNotReadyLogAt = now;
+
+    const suffix = this.recordingConfiguration && !this.recordingActive
+      ? " Apple Home has selected an HSV configuration, but recording is inactive. In Home app, set this camera to Stream & Allow Recording."
+      : " Wait until Apple Home selects a recording configuration and enables recording.";
+    this.platform.log.warn(`Cannot trigger Mijia HSV recording for ${this.config.name || this.config.did}: recordingActive=${this.recordingActive}, hasRecordingConfiguration=${Boolean(this.recordingConfiguration)}.${suffix}`);
   }
 
   async *handleRecordingStreamRequest(streamId, signal) {

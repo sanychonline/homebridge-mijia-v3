@@ -79,6 +79,8 @@ When `hsv` is enabled, the camera is published as a separate HomeKit camera acce
 }
 ```
 
+After installing from npm or re-pairing the camera, open Apple Home camera settings and set recording to **Stream & Allow Recording**. If Apple Home leaves the camera in stream-only mode, the plugin can detect motion but HomeKit will not request HSV fragments.
+
 Do not edit Homebridge `externalAccessories` or existing CameraUI/Doorbell pairing files manually.
 
 ## Local diagnostics API
