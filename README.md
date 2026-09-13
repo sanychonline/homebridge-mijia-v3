@@ -44,7 +44,7 @@ Current direction:
           "model": "mijia.camera.v3",
           "ip": "192.168.1.50",
           "deviceKey": "YOUR_DEVICE_KEY",
-          "cloudBootstrap": "cacheOnly",
+          "cloudBootstrap": "fallback",
           "hsv": true,
           "twoWayAudio": true,
           "powerSwitch": false
@@ -57,7 +57,7 @@ Current direction:
 
 The compact configuration intentionally omits stream tuning. Safe defaults for `mijia.camera.v3` provide MAIN `superhd`, SUB `sd`, 720p HomeKit output, camera audio, six seconds of encoded prebuffer, and five concurrent HomeKit consumers.
 
-`cloudBootstrap: "cacheOnly"` keeps normal camera operation local and reads the cached descriptor from `/homebridge/.xiaomi-1080p/miss-descriptors.json`. Xiaomi login is needed only to create or refresh that descriptor when it is unavailable or expired.
+`cloudBootstrap: "fallback"` keeps normal camera operation local and reads the cached descriptor from `/homebridge/.xiaomi-1080p/miss-descriptors.json`. If that descriptor is missing, the plugin uses the cached Xiaomi session once to refresh it. After the descriptor exists, you can set `cloudBootstrap: "local"` for strict offline startup.
 
 Private files are stored under `/homebridge/.xiaomi-1080p/` with owner-only permissions when the filesystem supports them. Do not publish `cachedSession`, `miss-descriptors.json`, device keys, Xiaomi account credentials, or debug captures.
 

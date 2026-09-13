@@ -51,8 +51,12 @@ class XiaomiLocalMissClient {
       return this.applyDescriptorOverrides(cached);
     }
 
-    if (mode === "cacheOnly" || mode === "local") {
-      throw new Error(`Local Xiaomi MISS descriptor cache is missing for ${this.config.name || this.config.did}; temporarily set cloudBootstrap=fallback to refresh it.`);
+    if (mode === "local") {
+      throw new Error(`Local Xiaomi MISS descriptor cache is missing for ${this.config.name || this.config.did}; set cloudBootstrap=fallback once to refresh it, then switch back to local.`);
+    }
+
+    if (mode === "cacheOnly") {
+      this.platform.log.warn(`cloudBootstrap=cacheOnly is a legacy setting. MISS descriptor cache is missing for ${this.config.name || this.config.did}; refreshing it once through Xiaomi Cloud session.`);
     }
 
     const descriptor = await this.cloud.getMissStreamDescriptor(this.config.did, {

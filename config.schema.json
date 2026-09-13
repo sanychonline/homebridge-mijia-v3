@@ -49,11 +49,12 @@
             "cloudBootstrap": {
               "title": "MISS Descriptor Source",
               "type": "string",
-              "default": "cacheOnly",
-              "description": "Use cacheOnly for fully local startup. Temporarily switch to fallback only when refreshing the local MISS descriptor cache.",
+              "default": "fallback",
+              "description": "Use cached local MISS descriptors during normal operation. If the cache is missing, fallback refreshes it once through the cached Xiaomi session. Use local only after the descriptor cache exists.",
               "oneOf": [
-                { "title": "Local cache only", "enum": ["cacheOnly"] },
                 { "title": "Use cache, fallback to Xiaomi cloud", "enum": ["fallback"] },
+                { "title": "Local cache only", "enum": ["local"] },
+                { "title": "Legacy cache-first bootstrap", "enum": ["cacheOnly"] },
                 { "title": "Always refresh from Xiaomi cloud", "enum": ["always"] }
               ]
             },
