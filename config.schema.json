@@ -1,0 +1,124 @@
+{
+  "pluginAlias": "Xiaomi Camera 1080P",
+  "pluginType": "platform",
+  "singular": true,
+  "customUi": true,
+  "headerDisplay": "Xiaomi 1080p local camera plugin. Most tuning options have safe defaults and can still be added manually to config.json when debugging.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Plugin Name",
+        "type": "string",
+        "default": "Xiaomi 1080p"
+      },
+      "cameras": {
+        "title": "Cameras",
+        "type": "array",
+        "items": {
+          "title": "Camera",
+          "type": "object",
+          "properties": {
+            "name": {
+              "title": "Name",
+              "type": "string",
+              "required": true
+            },
+            "did": {
+              "title": "Device ID",
+              "type": "string",
+              "required": true
+            },
+            "ip": {
+              "title": "Local IP",
+              "type": "string",
+              "placeholder": "192.168.1.50",
+              "required": true
+            },
+            "deviceKey": {
+              "title": "Device Key",
+              "type": "string",
+              "format": "password",
+              "required": true
+            },
+            "model": {
+              "title": "Model",
+              "type": "string",
+              "default": "mijia.camera.v3"
+            },
+            "cloudBootstrap": {
+              "title": "MISS Descriptor Source",
+              "type": "string",
+              "default": "cacheOnly",
+              "description": "Use cacheOnly for fully local startup. Temporarily switch to fallback only when refreshing the local MISS descriptor cache.",
+              "oneOf": [
+                { "title": "Local cache only", "enum": ["cacheOnly"] },
+                { "title": "Use cache, fallback to Xiaomi cloud", "enum": ["fallback"] },
+                { "title": "Always refresh from Xiaomi cloud", "enum": ["always"] }
+              ]
+            },
+            "hsv": {
+              "title": "HomeKit Secure Video",
+              "type": "boolean",
+              "default": true
+            },
+            "audio": {
+              "title": "Camera Microphone Audio",
+              "type": "boolean",
+              "default": true
+            },
+            "twoWayAudio": {
+              "title": "Two-Way Audio / Talkback",
+              "type": "boolean",
+              "default": false,
+              "description": "Advertises HomeKit Talk support. Camera speaker transport is still experimental."
+            },
+            "backgroundMonitoring": {
+              "title": "Background Still Image / Motion Monitoring",
+              "type": "boolean",
+              "default": true,
+              "description": "Keeps a lightweight local SUB stream open for still images and motion detection."
+            },
+            "motionDetection": {
+              "title": "Motion Detection",
+              "type": "boolean",
+              "default": true,
+              "description": "Uses native Xiaomi motion events when available and local SUB packet activity as a cloud-free fallback for HomeKit motion/HKSV."
+            },
+            "maxStreams": {
+              "title": "Maximum Concurrent HomeKit Streams",
+              "type": "integer",
+              "default": 5,
+              "minimum": 1
+            },
+            "localHttpApi": {
+              "title": "Local Diagnostics API",
+              "type": "boolean",
+              "default": false,
+              "description": "Exposes local health/status/snapshot endpoints for troubleshooting. Leave off for normal use. Non-loopback access requires a token."
+            },
+            "localHttpHost": {
+              "title": "Local Diagnostics API Host",
+              "type": "string",
+              "default": "127.0.0.1",
+              "description": "Bind diagnostics to loopback by default. Use 0.0.0.0 only with a strong Local Diagnostics API Token."
+            },
+            "localHttpPort": {
+              "title": "Local Diagnostics API Port",
+              "type": "integer",
+              "default": 8781,
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "localHttpToken": {
+              "title": "Local Diagnostics API Token",
+              "type": "string",
+              "format": "password",
+              "description": "Bearer token for protected local diagnostics/control endpoints when Local Diagnostics API is enabled."
+            }
+          }
+        }
+      }
+    }
+  }
+}

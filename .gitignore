@@ -1,0 +1,28 @@
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+
+# Homebridge / Xiaomi private state
+.mijiav3_micloud/
+.miot_micloud/
+.xiaomi-1080p/
+cachedSession
+miss-descriptors.json
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Local debug captures
+debug-artifacts/
+last-hsv-recording.mp4
+last-hsv-video.h264
+*.h264
+*.mp4
+*.wav
+
+# Local env/config overrides
+.env
+.env.*
+micloudlogin.json

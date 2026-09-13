@@ -1,0 +1,53 @@
+{
+  "name": "homebridge-mijia-v3",
+  "version": "0.1.0",
+  "displayName": "Xiaomi 1080p",
+  "description": "Experimental Homebridge camera plugin for Xiaomi/Mijia cameras using local MISS/TUTK media.",
+  "main": "src/index.js",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sanychonline/homebridge-mijia-v3.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sanychonline/homebridge-mijia-v3/issues"
+  },
+  "homepage": "https://github.com/sanychonline/homebridge-mijia-v3#readme",
+  "files": [
+    "src/",
+    "homebridge-ui/",
+    "tools/",
+    "config.schema.json",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "prepack": "npm test",
+    "cloud:login": "node tools/cloud-login.js",
+    "cloud:login:qr": "node tools/cloud-login.js --qr"
+  },
+  "keywords": [
+    "homebridge-plugin",
+    "xiaomi",
+    "mijia",
+    "camera",
+    "miot"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@homebridge/plugin-ui-utils": "^2.0.2",
+    "axios": "^1.7.9",
+    "axios-cookiejar-support": "^5.0.5",
+    "tough-cookie": "^4.1.4"
+  },
+  "devDependencies": {
+    "homebridge": "^2.0.0"
+  },
+  "peerDependencies": {
+    "homebridge": ">=1.6.0"
+  }
+}
