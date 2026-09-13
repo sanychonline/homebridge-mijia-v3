@@ -26,7 +26,7 @@ const CAMERA_DEFAULTS = Object.freeze({
     liveVideoPreset: 'veryfast',
     liveVideoResolution: '720p',
     localMotionTrigger: true,
-    mainPrebuffer: true,
+    mainPrebuffer: false,
     maxStreams: 5,
     missMainVideoQuality: 'superhd',
     motionActivityRatio: 3.5,

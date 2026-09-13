@@ -23,6 +23,7 @@ class MainPrebufferService {
     this.lastError = null;
     this.videoPackets = 0;
     this.videoBytes = 0;
+    this.failureCount = 0;
   }
 
   start() {
@@ -73,6 +74,7 @@ class MainPrebufferService {
 
       this.reader = reader;
       this.lastStartedAt = Date.now();
+      this.failureCount = 0;
       this.metrics?.increment("main_prebuffer_starts_total");
       this.metrics?.setGauge("main_prebuffer_active", 1);
 
@@ -115,14 +117,19 @@ class MainPrebufferService {
   handleReaderFailure(error, reason) {
     this.lastError = error?.message || String(error);
     this.metrics?.increment("main_prebuffer_failures_total");
-    this.platform.log.warn(`camera.main.prebuffer.${reason} camera=${this.cameraName()} error=${this.lastError}`);
+    this.failureCount += 1;
+    const isFrameTimeout = /Timed out waiting for frame/i.test(this.lastError);
+    const log = isFrameTimeout ? this.platform.log.info : this.platform.log.warn;
+    log.call(this.platform.log, `camera.main.prebuffer.${reason} camera=${this.cameraName()} error=${this.lastError}`);
     this.closeReader(reason);
 
     if (!this.enabled || this.stopping) {
       return;
     }
 
-    const delayMs = Math.max(Number(this.config.mainPrebufferRestartDelayMs || 10000), 1000);
+    const baseDelayMs = Math.max(Number(this.config.mainPrebufferRestartDelayMs || 10000), 1000);
+    const maxDelayMs = Math.max(Number(this.config.mainPrebufferMaxRestartDelayMs || 120000), baseDelayMs);
+    const delayMs = Math.min(baseDelayMs * Math.max(this.failureCount, 1), maxDelayMs);
     clearTimeout(this.restartTimer);
     this.restartTimer = setTimeout(() => this.start(), delayMs);
     this.restartTimer.unref?.();
@@ -183,6 +190,7 @@ class MainPrebufferService {
       audio: false,
       videoPackets: this.videoPackets,
       videoBytes: this.videoBytes,
+      failureCount: this.failureCount,
       lastStartedAt: this.lastStartedAt,
       lastStoppedAt: this.lastStoppedAt,
       lastError: this.lastError,

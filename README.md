@@ -27,6 +27,7 @@ Current direction:
 - Use the low-resource SUB stream for motion monitoring and still images.
 - Prefer explicit native MISS motion events when the camera sends them, with SUB packet activity as a local fallback.
 - Use the MAIN stream for HomeKit Live View and HomeKit Secure Video.
+- Keep the continuous MAIN prebuffer disabled by default; enable `mainPrebuffer` only if you explicitly want a background MAIN stream for HSV prebuffering.
 - Use Xiaomi Cloud only as an optional bootstrap source for the cached MISS descriptor.
 
 ## Homebridge config
@@ -55,7 +56,7 @@ Current direction:
 }
 ```
 
-The compact configuration intentionally omits stream tuning. Safe defaults for `mijia.camera.v3` provide MAIN `superhd`, SUB `sd`, 720p HomeKit output, camera audio, six seconds of encoded prebuffer, and five concurrent HomeKit consumers.
+The compact configuration intentionally omits stream tuning. Safe defaults for `mijia.camera.v3` provide MAIN `superhd`, SUB `sd`, 720p HomeKit output, camera audio, SUB-based still/motion monitoring, and five concurrent HomeKit consumers. Continuous MAIN prebuffering is off by default to avoid keeping an extra high-bitrate camera session open.
 
 `cloudBootstrap: "fallback"` keeps normal camera operation local and reads the cached descriptor from `/homebridge/.xiaomi-1080p/miss-descriptors.json`. If that descriptor is missing, the plugin uses the cached Xiaomi session once to refresh it. After the descriptor exists, you can set `cloudBootstrap: "local"` for strict offline startup.
 
