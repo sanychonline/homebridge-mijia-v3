@@ -21,6 +21,7 @@ class XiaomiCameraStreamingDelegate {
     this.snapshotInFlight = null;
     this.snapshotRefreshTimer = null;
     this.liveStreamStarting = 0;
+    this.preconnectedReaders = new Map();
     this.sharedReaders = new Map();
     this.sharedReader = null;
     this.sharedReaderOpening = null;
@@ -124,6 +125,7 @@ class XiaomiCameraStreamingDelegate {
 
     this.sessions.set(request.sessionID, sessionInfo);
     this.platform.log.info(`Prepared Mijia stream session ${request.sessionID}: target=${sessionInfo.address}:${sessionInfo.videoPort}`);
+    this.startLivePreconnect(request);
 
     const response = {
       video: {
@@ -212,7 +214,10 @@ class XiaomiCameraStreamingDelegate {
     this.liveStreamStarting += 1;
     try {
       const streamPurpose = this.livePurposeForRequest(request);
-      const stream = await this.resolveInputStream(streamPurpose);
+      const preconnectedReader = await this.claimPreconnectedReader(request.sessionID, streamPurpose);
+      const stream = preconnectedReader
+        ? { reader: preconnectedReader }
+        : await this.resolveInputStream(streamPurpose);
 
       if (stream?.reader) {
         this.platform.log.info(`Selected Xiaomi MISS ${streamPurpose} stream for ${this.config.name || this.config.did}: requested=${request.video?.width || "?"}x${request.video?.height || "?"}, bitrate=${request.video?.max_bit_rate || "?"}k`);
@@ -603,6 +608,85 @@ class XiaomiCameraStreamingDelegate {
     return { reader };
   }
 
+  startLivePreconnect(request) {
+    if (this.config.livePreconnect === false || this.preconnectedReaders.has(request.sessionID)) {
+      return;
+    }
+
+    const purpose = this.livePurposeForRequest(request);
+    const timeoutMs = Math.max(Number(this.config.livePreconnectIdleTimeoutMs || 45000), 5000);
+    const entry = {
+      purpose,
+      reader: null,
+      opening: null,
+      timer: null,
+    };
+    this.preconnectedReaders.set(request.sessionID, entry);
+
+    entry.timer = setTimeout(() => {
+      this.releasePreconnectedReader(request.sessionID, "idle-timeout");
+    }, timeoutMs);
+    entry.timer.unref?.();
+
+    this.platform.log.info(`Preconnecting Xiaomi MISS ${purpose} stream for ${this.config.name || this.config.did}: session=${request.sessionID}`);
+    entry.opening = this.acquireSharedReader({ purpose })
+      .then((reader) => {
+        if (!this.preconnectedReaders.has(request.sessionID)) {
+          this.releaseSharedReader(reader);
+          return null;
+        }
+        entry.reader = reader;
+        this.platform.log.info(`Preconnected Xiaomi MISS ${purpose} stream for ${this.config.name || this.config.did}: session=${request.sessionID}`);
+        return reader;
+      })
+      .catch((error) => {
+        this.preconnectedReaders.delete(request.sessionID);
+        this.platform.log.debug(`Xiaomi MISS preconnect failed for ${this.config.name || this.config.did}: session=${request.sessionID}, error=${error.message}`);
+        return null;
+      });
+  }
+
+  async claimPreconnectedReader(sessionId, purpose) {
+    const entry = this.preconnectedReaders.get(sessionId);
+    if (!entry) {
+      return null;
+    }
+
+    this.preconnectedReaders.delete(sessionId);
+    clearTimeout(entry.timer);
+
+    const reader = entry.reader || await entry.opening;
+    if (!reader || reader.closed) {
+      return null;
+    }
+
+    if (entry.purpose !== purpose) {
+      this.releaseSharedReader(reader);
+      return null;
+    }
+
+    this.platform.log.info(`Using preconnected Xiaomi MISS ${purpose} stream for ${this.config.name || this.config.did}: session=${sessionId}`);
+    return reader;
+  }
+
+  releasePreconnectedReader(sessionId, reason) {
+    const entry = this.preconnectedReaders.get(sessionId);
+    if (!entry) {
+      return;
+    }
+
+    this.preconnectedReaders.delete(sessionId);
+    clearTimeout(entry.timer);
+    Promise.resolve(entry.reader || entry.opening)
+      .then((reader) => {
+        if (reader) {
+          this.platform.log.debug(`Releasing preconnected Xiaomi MISS stream for ${this.config.name || this.config.did}: session=${sessionId}, reason=${reason}`);
+          this.releaseSharedReader(reader);
+        }
+      })
+      .catch(() => {});
+  }
+
   setMotionSink(motionSink) {
     this.motionDetector.setMotionSink(motionSink);
   }
@@ -854,6 +938,7 @@ class XiaomiCameraStreamingDelegate {
   }
 
   stopStream(sessionId) {
+    this.releasePreconnectedReader(sessionId, "stop");
     const session = this.sessions.get(sessionId);
     if (session?.process) {
       this.terminateStreamProcess(sessionId, session, "stop");
