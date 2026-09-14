@@ -27,7 +27,6 @@ Current direction:
 - Use the low-resource SUB stream for motion monitoring and still images.
 - Prefer explicit native MISS motion events when the camera sends them, with SUB packet activity as a local fallback.
 - Use the MAIN stream for HomeKit Live View and HomeKit Secure Video.
-- Preconnect the local MISS reader during HomeKit stream preparation to reduce Live View startup latency.
 - Keep the continuous MAIN prebuffer disabled by default; enable `mainPrebuffer` only if you explicitly want a background MAIN stream for HSV prebuffering.
 - Use Xiaomi Cloud only as an optional bootstrap source for the cached MISS descriptor.
 

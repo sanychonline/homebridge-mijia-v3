@@ -19,7 +19,7 @@ const CAMERA_DEFAULTS = Object.freeze({
     hsvMissVideoQuality: 'superhd',
     hsvMotionDurationMs: 20000,
     liveAudioCodec: 'aac-eld',
-    livePreconnect: true,
+    livePreconnect: false,
     livePreconnectIdleTimeoutMs: 45000,
     liveSubMaxBitrateKbps: 0,
     liveVideoBitrateKbps: 2200,
