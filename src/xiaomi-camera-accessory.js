@@ -51,6 +51,7 @@ class XiaomiCameraAccessory {
       (packet, context) => this.streamingDelegate.observeMonitoringPacket(packet, context),
       this.streamingDelegate,
     );
+    this.streamingDelegate.setMonitoringService(this.monitoringService);
     this.mainPrebufferService = new MainPrebufferService(
       platform,
       this.cloud,

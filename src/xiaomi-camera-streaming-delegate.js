@@ -22,6 +22,8 @@ class XiaomiCameraStreamingDelegate {
     this.snapshotRefreshTimer = null;
     this.liveStreamStarting = 0;
     this.preconnectedReaders = new Map();
+    this.monitoringService = null;
+    this.backgroundPausedForMain = 0;
     this.sharedReaders = new Map();
     this.sharedReader = null;
     this.sharedReaderOpening = null;
@@ -162,9 +164,14 @@ class XiaomiCameraStreamingDelegate {
     }
 
     if (request.type === "reconfigure") {
-      this.bumpStreamWatchdog(request.sessionID, "reconfigure");
-      this.platform.log.info(`Ignoring Mijia stream reconfigure for active session ${request.sessionID}`);
-      callback();
+      try {
+        await this.reconfigureStream(request);
+        this.bumpStreamWatchdog(request.sessionID, "reconfigure");
+        callback();
+      } catch (error) {
+        this.platform.log.warn(`Failed to reconfigure Mijia stream session ${request.sessionID}: ${error.message}`);
+        callback();
+      }
       return;
     }
 
@@ -214,6 +221,9 @@ class XiaomiCameraStreamingDelegate {
     this.liveStreamStarting += 1;
     try {
       const streamPurpose = this.livePurposeForRequest(request);
+      if (streamPurpose === "live") {
+        await this.pauseBackgroundMonitoring(`homekit-live:${request.sessionID}`);
+      }
       const preconnectedReader = await this.claimPreconnectedReader(request.sessionID, streamPurpose);
       const stream = preconnectedReader
         ? { reader: preconnectedReader }
@@ -223,6 +233,7 @@ class XiaomiCameraStreamingDelegate {
         this.platform.log.info(`Selected Xiaomi MISS ${streamPurpose} stream for ${this.config.name || this.config.did}: requested=${request.video?.width || "?"}x${request.video?.height || "?"}, bitrate=${request.video?.max_bit_rate || "?"}k`);
         this.metrics?.recordLiveStreamStarted(streamPurpose);
         this.stateMachine?.liveStarted(`homekit-live:${streamPurpose}`);
+        session.streamPurpose = streamPurpose;
         session.process = this.spawnFfmpegFromMissReader(request, session, stream.reader, 1, streamPurpose);
         const talkbackResult = await this.talkback?.startStream?.(request, stream.reader);
         if (talkbackResult?.ok === false) {
@@ -236,6 +247,81 @@ class XiaomiCameraStreamingDelegate {
     }
 
     throw new Error("Native Xiaomi MISS reader did not return a stream reader.");
+  }
+
+  async reconfigureStream(request) {
+    const session = this.sessions.get(request.sessionID);
+    if (!session?.process) {
+      this.platform.log.info(`Ignoring Mijia stream reconfigure for inactive session ${request.sessionID}`);
+      return;
+    }
+
+    const nextPurpose = this.livePurposeForRequest(request, { fastStart: false });
+    if (!nextPurpose || nextPurpose === session.streamPurpose) {
+      this.platform.log.info(`Keeping Mijia stream session ${request.sessionID} on ${session.streamPurpose || "unknown"} after reconfigure.`);
+      return;
+    }
+
+    if (nextPurpose === "live") {
+      await this.pauseBackgroundMonitoring(`homekit-reconfigure:${request.sessionID}`);
+    }
+
+    const stream = await this.resolveInputStream(nextPurpose);
+    if (!stream?.reader) {
+      throw new Error("Native Xiaomi MISS reader did not return a stream reader for reconfigure.");
+    }
+
+    const oldProcess = session.process;
+    this.platform.log.info(`Switching Mijia stream session ${request.sessionID}: ${session.streamPurpose || "unknown"} -> ${nextPurpose}`);
+    session.streamPurpose = nextPurpose;
+    session.process = this.spawnFfmpegFromMissReader(request, session, stream.reader, 1, nextPurpose);
+    if (oldProcess && !oldProcess.killed) {
+      oldProcess.expectedStopReason = "reconfigure";
+      try {
+        oldProcess.stdio?.[3]?.end();
+        oldProcess.audioPacer?.stop();
+        oldProcess.stdio?.[4]?.end();
+      } catch (_error) {
+        // Ignore pipe shutdown races.
+      }
+      oldProcess.kill("SIGTERM");
+    }
+  }
+
+  setMonitoringService(monitoringService) {
+    this.monitoringService = monitoringService || null;
+  }
+
+  async pauseBackgroundMonitoring(reason) {
+    if (this.config.exclusiveMainStream === false || !this.monitoringService) {
+      return;
+    }
+
+    this.backgroundPausedForMain += 1;
+    if (this.backgroundPausedForMain > 1) {
+      return;
+    }
+
+    this.platform.log.info(`Pausing SUB monitoring while MAIN stream is active for ${this.config.name || this.config.did}: reason=${reason}`);
+    this.monitoringService.stop(reason);
+    const delayMs = Math.max(Number(this.config.exclusiveReaderSwitchDelayMs ?? 250), 0);
+    if (delayMs > 0) {
+      await delay(delayMs);
+    }
+  }
+
+  resumeBackgroundMonitoring(reason) {
+    if (this.config.exclusiveMainStream === false || !this.monitoringService || this.backgroundPausedForMain <= 0) {
+      return;
+    }
+
+    this.backgroundPausedForMain -= 1;
+    if (this.backgroundPausedForMain > 0) {
+      return;
+    }
+
+    this.platform.log.info(`Resuming SUB monitoring after MAIN stream ended for ${this.config.name || this.config.did}: reason=${reason}`);
+    this.monitoringService.start();
   }
 
   spawnFfmpegFromMissReader(request, session, reader, attempt, streamPurpose = "live") {
@@ -504,6 +590,9 @@ class XiaomiCameraStreamingDelegate {
           source: streamPurpose,
           videoQuality: this.videoQualityForPurpose(streamPurpose),
         });
+        if (this.backgroundPausedForMain > 0) {
+          this.observeMotionPacket(packet);
+        }
         if (!videoPipePrimed && packet.codec === "h264") {
           if (hasH264ParameterSet(packet, 7)) {
             videoStartupPackets.length = 0;
@@ -593,7 +682,13 @@ class XiaomiCameraStreamingDelegate {
       reader.off("error", onReaderError);
       audioPacer?.stop();
       this.clearStreamWatchdog(request.sessionID);
-      this.sessions.delete(request.sessionID);
+      const currentSession = this.sessions.get(request.sessionID);
+      if (currentSession?.process === proc) {
+        this.sessions.delete(request.sessionID);
+        if (streamPurpose === "live") {
+          this.resumeBackgroundMonitoring(`homekit-live-ended:${request.sessionID}`);
+        }
+      }
       this.releaseSharedReader(reader);
     });
 
@@ -705,14 +800,18 @@ class XiaomiCameraStreamingDelegate {
       source: context.source || "background-monitoring",
       videoQuality: context.quality || this.videoQualityForPurpose("monitoring"),
     });
+    this.observeMotionPacket(packet);
+    this.feedSnapshotFromPacket(packet).catch((error) => {
+      this.platform.log.debug(`Could not update local Mijia snapshot from monitoring packet: ${error.message}`);
+    });
+  }
+
+  observeMotionPacket(packet) {
     if (this.motionAnalyzer.enabled) {
       this.motionAnalyzer.observePacket(packet);
     } else {
       this.motionDetector.observePacket(packet);
     }
-    this.feedSnapshotFromPacket(packet).catch((error) => {
-      this.platform.log.debug(`Could not update local Mijia snapshot from monitoring packet: ${error.message}`);
-    });
   }
 
   observePrebufferPacket(packet, context = {}) {
@@ -940,11 +1039,15 @@ class XiaomiCameraStreamingDelegate {
   stopStream(sessionId) {
     this.releasePreconnectedReader(sessionId, "stop");
     const session = this.sessions.get(sessionId);
+    const streamPurpose = session?.streamPurpose;
     if (session?.process) {
       this.terminateStreamProcess(sessionId, session, "stop");
     }
     this.sessions.delete(sessionId);
     this.clearStreamWatchdog(sessionId);
+    if (streamPurpose === "live") {
+      this.resumeBackgroundMonitoring(`homekit-stop:${sessionId}`);
+    }
   }
 
   bumpStreamWatchdog(sessionId, reason) {
@@ -1044,7 +1147,7 @@ class XiaomiCameraStreamingDelegate {
     return this.config.liveMissVideoQuality || this.config.liveVideoQuality || mainQuality;
   }
 
-  livePurposeForRequest(request) {
+  livePurposeForRequest(request, options = {}) {
     if (this.hksvReaderActive && this.hksvReaderQuality && this.hksvReaderQuality === this.videoQualityForPurpose("live")) {
       this.platform.log.info(`Using shared MAIN stream for live view while HSV is active for ${this.config.name || this.config.did}: quality=${this.hksvReaderQuality}`);
       return "live";
@@ -1057,6 +1160,16 @@ class XiaomiCameraStreamingDelegate {
     const subMaxWidth = Number(this.config.liveSubMaxWidth || 640);
     const subMaxHeight = Number(this.config.liveSubMaxHeight || 480);
     const subMaxBitrate = Number(this.config.liveSubMaxBitrateKbps || 700);
+    const fastStart = options.fastStart !== false && this.config.liveFastStartSubStream !== false;
+
+    if (
+      fastStart
+      && Number.isFinite(bitrate)
+      && bitrate > 0
+      && bitrate <= subMaxBitrate
+    ) {
+      return "live-sub";
+    }
 
     if (
       (Number.isFinite(width) && width > 0 && width <= subMaxWidth)

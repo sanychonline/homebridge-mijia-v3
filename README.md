@@ -26,6 +26,7 @@ Current direction:
 - Read H.264 video and PCMA audio directly from the camera over local MISS/TUTK.
 - Use the low-resource SUB stream for motion monitoring and still images.
 - Prefer explicit native MISS motion events when the camera sends them, with SUB packet activity as a local fallback.
+- Start HomeKit Live View on the SUB stream for low-bitrate startup requests, then switch to MAIN on HomeKit reconfigure.
 - Use the MAIN stream for HomeKit Live View and HomeKit Secure Video.
 - Keep the continuous MAIN prebuffer disabled by default; enable `mainPrebuffer` only if you explicitly want a background MAIN stream for HSV prebuffering.
 - Use Xiaomi Cloud only as an optional bootstrap source for the cached MISS descriptor.
