@@ -44,6 +44,7 @@ const CAMERA_DEFAULTS = Object.freeze({
     motionVideoAnalysis: true,
     motionMinBytes: 50000,
     motionWarmupMs: 30000,
+    readerIdleTimeoutMs: 30000,
     streamMaxDurationMs: 0,
   }),
 });
