@@ -338,7 +338,21 @@ class LocalHttpApi {
       });
     }
 
-    if (monitoring.enabled && !monitoring.active) {
+    const sharedReader = streaming.sharedReader || {};
+    const mainQuality = this.streamingDelegate.videoQualityForPurpose?.("live");
+    const subMonitoringSuspendedForMain = monitoring.enabled
+      && !monitoring.active
+      && Number(streaming.activeStreams || 0) > 0
+      && sharedReader.active
+      && sharedReader.quality === mainQuality;
+
+    if (subMonitoringSuspendedForMain) {
+      checks.push({
+        name: "sub-monitoring-active",
+        ok: true,
+        detail: `Background SUB monitoring is suspended while MAIN live/HSV stream is active. activeStreams=${streaming.activeStreams}, quality=${sharedReader.quality || "unknown"}.`,
+      });
+    } else if (monitoring.enabled && !monitoring.active) {
       checks.push({
         name: "sub-monitoring-active",
         ok: false,

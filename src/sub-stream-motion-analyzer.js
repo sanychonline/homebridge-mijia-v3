@@ -1,6 +1,7 @@
 "use strict";
 
 const { spawn } = require("child_process");
+const { analyzeMotionFrame } = require("./motion-frame-detector");
 
 // Threshold semantics are adapted from camera.ui's MIT-licensed
 // videoanalysis.service (SeydX): pixel difference plus changed-pixel percent.
@@ -15,10 +16,14 @@ class SubStreamMotionAnalyzer {
     this.height = boundedInteger(config.motionAnalysisHeight, 36, 360, 90);
     this.fps = boundedNumber(config.motionAnalysisFps, 0.5, 5, 2);
     this.difference = boundedInteger(config.motionAnalysisDifference, 1, 255, 5);
-    this.sensitivity = boundedNumber(config.motionAnalysisSensitivity, 0, 100, 75);
+    this.sensitivity = boundedNumber(config.motionAnalysisSensitivity, 0, 100, 98.5);
     this.changedPercentThreshold = Math.max(100 - this.sensitivity, 0.1);
+    this.consecutiveFramesRequired = boundedInteger(config.motionAnalysisConsecutiveFrames, 1, 10, 2);
+    this.consecutiveFrames = 0;
     this.warmupFrames = boundedInteger(config.motionAnalysisWarmupFrames, 1, 60, 4);
     this.frameSize = this.width * this.height;
+    this.minimumRegionPixels = boundedInteger(config.motionAnalysisMinimumRegionPixels, 1, this.frameSize, Math.max(12, Math.round(this.frameSize / 600)));
+    this.noiseMultiplier = boundedNumber(config.motionAnalysisNoiseMultiplier, 1, 8, 4);
     this.process = null;
     this.input = null;
     this.outputRemainder = Buffer.alloc(0);
@@ -26,15 +31,26 @@ class SubStreamMotionAnalyzer {
     this.startupHasParameterSet = false;
     this.previousFrame = null;
     this.frames = 0;
+    this.framesSinceStart = 0;
     this.triggers = 0;
     this.inputBytes = 0;
     this.inputPackets = 0;
     this.inputBackpressureEvents = 0;
     this.lastFrameAt = null;
     this.lastChangedPercent = null;
+    this.lastRawChangedPercent = null;
+    this.lastNoiseDifference = this.difference;
+    this.lastBrightnessShift = 0;
+    this.lastLargestRegionPixels = 0;
     this.maximumChangedPercent = 0;
     this.lastError = null;
     this.restartAfter = 0;
+    this.inputGapResetMs = Math.max(2000, 3000 / this.fps);
+    this.lastPacketAt = null;
+    this.streamParameterSet = null;
+    this.streamResets = 0;
+    this.comparisonResets = 0;
+    this.lastResetReason = null;
   }
 
   observePacket(packet) {
@@ -45,6 +61,20 @@ class SubStreamMotionAnalyzer {
     this.inputPackets += 1;
     this.inputBytes += packet.payload.length;
 
+    const now = Date.now();
+    const parameterSet = findH264ParameterSet(packet.payload);
+    const inputGap = this.lastPacketAt !== null && now - this.lastPacketAt > this.inputGapResetMs;
+    const parametersChanged = parameterSet !== null
+      && this.streamParameterSet !== null
+      && parameterSet !== this.streamParameterSet;
+    if (inputGap || parametersChanged) {
+      this.resetStream(parametersChanged ? "h264-parameters-changed" : "input-gap");
+    }
+    this.lastPacketAt = now;
+    if (parameterSet !== null) {
+      this.streamParameterSet = parameterSet;
+    }
+
     if (!this.process) {
       if (Date.now() < this.restartAfter) {
         return false;
@@ -54,6 +84,35 @@ class SubStreamMotionAnalyzer {
     }
 
     return this.writeInput(packet.payload);
+  }
+
+  resetComparison(reason) {
+    this.previousFrame = null;
+    this.framesSinceStart = 0;
+    this.consecutiveFrames = 0;
+    this.lastChangedPercent = null;
+    this.lastRawChangedPercent = null;
+    this.comparisonResets += 1;
+    this.lastResetReason = reason;
+  }
+
+  resetStream(reason) {
+    const proc = this.process;
+    const input = this.input;
+    this.process = null;
+    this.input = null;
+    this.outputRemainder = Buffer.alloc(0);
+    this.startupPackets = [];
+    this.startupHasParameterSet = false;
+    this.streamParameterSet = null;
+    this.restartAfter = 0;
+    this.resetComparison(reason);
+    this.streamResets += 1;
+    this.metrics?.increment("motion_analysis_stream_resets_total");
+    // Drop decoder reference frames and queued output, not just our last
+    // grayscale frame. SD and HD must never share a comparison history.
+    input?.destroy();
+    proc?.kill("SIGTERM");
   }
 
   bufferUntilKeyframe(payload) {
@@ -92,12 +151,17 @@ class SubStreamMotionAnalyzer {
       "-loglevel", this.config.motionAnalysisFfmpegDebug === true ? "info" : "warning",
       "-fflags", "+discardcorrupt+nobuffer",
       "-flags", "low_delay",
+      "-probesize", "32768",
+      "-analyzeduration", "100000",
+      "-fpsprobesize", "0",
+      "-threads", "1",
       "-f", "h264",
       "-i", "pipe:3",
       "-an",
       "-vf", `fps=${this.fps},scale=${this.width}:${this.height},format=gray`,
       "-pix_fmt", "gray",
       "-f", "rawvideo",
+      "-flush_packets", "1",
       "pipe:1",
     ];
 
@@ -106,21 +170,33 @@ class SubStreamMotionAnalyzer {
     this.input = proc.stdio[3];
     this.outputRemainder = Buffer.alloc(0);
     this.previousFrame = null;
+    this.framesSinceStart = 0;
+    this.consecutiveFrames = 0;
     this.lastError = null;
     let stderr = "";
 
     const onPipeError = (label) => (error) => {
+      if (this.process !== proc) {
+        return;
+      }
       this.lastError = error.message;
       this.platform.log.debug(`motion.analysis.${label}.closed camera=${this.cameraName()} error=${error.message}`);
     };
     this.input.on("error", onPipeError("input"));
     proc.stdout.on("error", onPipeError("output"));
     proc.stderr.on("error", onPipeError("stderr"));
-    proc.stdout.on("data", (chunk) => this.consumeOutput(chunk));
+    proc.stdout.on("data", (chunk) => {
+      if (this.process === proc) {
+        this.consumeOutput(chunk);
+      }
+    });
     proc.stderr.on("data", (chunk) => {
       stderr = (stderr + chunk.toString()).slice(-3000);
     });
     proc.on("error", (error) => {
+      if (this.process !== proc) {
+        return;
+      }
       this.lastError = error.message;
       this.metrics?.increment("motion_analysis_errors_total");
     });
@@ -141,7 +217,7 @@ class SubStreamMotionAnalyzer {
     });
 
     this.metrics?.increment("motion_analysis_starts_total");
-    this.platform.log.info(`motion.analysis.started camera=${this.cameraName()} source=shared-sub size=${this.width}x${this.height} fps=${this.fps} difference=${this.difference} changedPercent=${this.changedPercentThreshold}`);
+    this.platform.log.info(`motion.analysis.started camera=${this.cameraName()} source=shared-sub size=${this.width}x${this.height} fps=${this.fps} difference=${this.difference} changedPercent=${this.changedPercentThreshold} adaptiveNoise=true minimumRegionPixels=${this.minimumRegionPixels}`);
   }
 
   writeInput(payload) {
@@ -177,30 +253,50 @@ class SubStreamMotionAnalyzer {
   }
 
   processFrame(frame) {
+    const now = Date.now();
+    if (this.previousFrame && this.lastFrameAt !== null && now - this.lastFrameAt > this.inputGapResetMs) {
+      this.resetComparison("decoded-frame-gap");
+    }
     this.frames += 1;
-    this.lastFrameAt = Date.now();
+    this.framesSinceStart += 1;
+    this.lastFrameAt = now;
     this.metrics?.increment("motion_analysis_frames_total");
     if (!this.previousFrame || this.previousFrame.length !== frame.length) {
       this.previousFrame = frame;
+      this.consecutiveFrames = 0;
       return false;
     }
 
-    let changed = 0;
-    for (let index = 0; index < frame.length; index += 1) {
-      if (Math.abs(frame[index] - this.previousFrame[index]) >= this.difference) {
-        changed += 1;
-      }
-    }
+    const analysis = analyzeMotionFrame(frame, this.previousFrame, {
+      width: this.width,
+      height: this.height,
+      difference: this.difference,
+      minimumRegionPixels: this.minimumRegionPixels,
+      noiseMultiplier: this.noiseMultiplier,
+    });
     this.previousFrame = frame;
 
-    const changedPercent = (changed / frame.length) * 100;
+    const changedPercent = analysis.changedPercent;
     this.lastChangedPercent = round2(changedPercent);
+    this.lastRawChangedPercent = round2(analysis.rawChangedPercent);
+    this.lastNoiseDifference = analysis.effectiveDifference;
+    this.lastBrightnessShift = analysis.brightnessShift;
+    this.lastLargestRegionPixels = analysis.largestRegionPixels;
     this.maximumChangedPercent = Math.max(this.maximumChangedPercent, this.lastChangedPercent);
     this.metrics?.setGauge("motion_analysis_changed_percent", this.lastChangedPercent);
-    if (this.frames <= this.warmupFrames || changedPercent < this.changedPercentThreshold) {
+    this.metrics?.setGauge("motion_analysis_raw_changed_percent", this.lastRawChangedPercent);
+    this.metrics?.setGauge("motion_analysis_noise_difference", this.lastNoiseDifference);
+    if (!analysis.valid || this.framesSinceStart <= this.warmupFrames || changedPercent < this.changedPercentThreshold) {
+      this.consecutiveFrames = 0;
       return false;
     }
 
+    this.consecutiveFrames += 1;
+    if (this.consecutiveFrames < this.consecutiveFramesRequired) {
+      return false;
+    }
+
+    this.consecutiveFrames = 0;
     this.triggers += 1;
     this.metrics?.increment("motion_analysis_triggers_total");
     this.motionSink?.({
@@ -209,6 +305,10 @@ class SubStreamMotionAnalyzer {
       changedPercent: this.lastChangedPercent,
       thresholdPercent: this.changedPercentThreshold,
       difference: this.difference,
+      effectiveDifference: this.lastNoiseDifference,
+      brightnessShift: this.lastBrightnessShift,
+      largestRegionPixels: this.lastLargestRegionPixels,
+      consecutiveFramesRequired: this.consecutiveFramesRequired,
     });
     return true;
   }
@@ -224,14 +324,28 @@ class SubStreamMotionAnalyzer {
       difference: this.difference,
       sensitivity: this.sensitivity,
       changedPercentThreshold: this.changedPercentThreshold,
+      consecutiveFramesRequired: this.consecutiveFramesRequired,
+      consecutiveFrames: this.consecutiveFrames,
       warmupFrames: this.warmupFrames,
       frames: this.frames,
+      framesSinceStart: this.framesSinceStart,
+      streamResets: this.streamResets,
+      comparisonResets: this.comparisonResets,
+      lastResetReason: this.lastResetReason,
+      inputGapResetMs: this.inputGapResetMs,
       triggers: this.triggers,
       inputPackets: this.inputPackets,
       inputBytes: this.inputBytes,
       inputBackpressureEvents: this.inputBackpressureEvents,
       lastFrameAt: this.lastFrameAt,
       lastChangedPercent: this.lastChangedPercent,
+      lastRawChangedPercent: this.lastRawChangedPercent,
+      effectiveDifference: this.lastNoiseDifference,
+      brightnessShift: this.lastBrightnessShift,
+      largestRegionPixels: this.lastLargestRegionPixels,
+      minimumRegionPixels: this.minimumRegionPixels,
+      noiseMultiplier: this.noiseMultiplier,
+      algorithm: "adaptive-regions",
       maximumChangedPercent: round2(this.maximumChangedPercent),
       lastError: this.lastError,
     };
@@ -240,6 +354,29 @@ class SubStreamMotionAnalyzer {
   cameraName() {
     return this.config.name || this.config.did || "xiaomi-camera";
   }
+}
+
+function findH264ParameterSet(buffer) {
+  let parameterStart = -1;
+  for (let index = 0; index + 3 < buffer.length; index += 1) {
+    if (buffer[index] !== 0 || buffer[index + 1] !== 0) {
+      continue;
+    }
+    const prefixLength = buffer[index + 2] === 1 ? 3
+      : buffer[index + 2] === 0 && buffer[index + 3] === 1 ? 4 : 0;
+    if (!prefixLength) {
+      continue;
+    }
+    if (parameterStart >= 0) {
+      return buffer.subarray(parameterStart, index).toString("hex");
+    }
+    const nalOffset = index + prefixLength;
+    if (nalOffset < buffer.length && (buffer[nalOffset] & 0x1f) === 7) {
+      parameterStart = nalOffset;
+    }
+    index = nalOffset - 1;
+  }
+  return parameterStart < 0 ? null : buffer.subarray(parameterStart).toString("hex");
 }
 
 function findH264NalTypes(buffer) {

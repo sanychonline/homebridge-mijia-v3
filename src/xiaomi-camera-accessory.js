@@ -161,19 +161,20 @@ class XiaomiCameraAccessory {
     this.platform.log.info(`motion.detected camera=${this.config.name || this.config.did} source=${event?.source || "unknown"} durationMs=${durationMs}`);
     this.stateMachine?.motionDetected(durationMs, `motion:${event?.source || "unknown"}`, event);
 
-    if (this.motionService) {
+    clearTimeout(this.motionClearTimer);
+    this.motionClearTimer = null;
+    const recordingResult = this.recordingDelegate?.triggerMotionEvent({ ...event, durationMs });
+    // HSV owns the HomeKit motion characteristic and its recording deadline.
+    // A second accessory timer must not end the event while HSV is extending it.
+    const managedByHsv = Boolean(recordingResult && !recordingResult.error);
+    if (this.motionService && !managedByHsv) {
       this.motionService.updateCharacteristic(Characteristic.MotionDetected, true);
-      clearTimeout(this.motionClearTimer);
       this.motionClearTimer = setTimeout(() => {
         this.motionService?.updateCharacteristic(Characteristic.MotionDetected, false);
         this.stateMachine?.motionCleared("homekit-motion-clear");
         this.platform.log.info(`motion.cleared camera=${this.config.name || this.config.did}`);
       }, durationMs);
       this.motionClearTimer.unref?.();
-    }
-
-    if (this.recordingDelegate) {
-      this.recordingDelegate.triggerMotionEvent(event);
     }
 
     return {

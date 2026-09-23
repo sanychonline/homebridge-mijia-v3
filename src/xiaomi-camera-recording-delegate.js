@@ -6,6 +6,8 @@ const net = require("net");
 const { spawn } = require("child_process");
 const { LocalRecorder } = require("./local-recorder");
 const { MotionEventManager } = require("./motion-event-manager");
+const { Mp4RecordingTimeline } = require("./mp4-recording-timeline");
+const { HsvMatroskaInput } = require("./hsv-matroska-input");
 
 class XiaomiCameraRecordingDelegate {
   constructor(platform, config, streamingDelegate, metrics, stateMachine) {
@@ -201,80 +203,88 @@ class XiaomiCameraRecordingDelegate {
     let fragmentCount = 0;
     let pendingFragment = null;
     let finalFragmentSent = false;
+    let mediaFragmentCount = 0;
+    let streamError = null;
+    const mediaTimeline = new Mp4RecordingTimeline();
     const startedAt = Date.now();
+    const recordingPacket = (fragment, isLast) => {
+      emitted = true;
+      fragmentCount += 1;
+      if (fragment.type === "mdat") mediaFragmentCount += 1;
+      this.metrics?.increment("hksv_fragments_total");
+      if (fragmentCount <= 3 || isLast || this.config.hsvFfmpegDebug) {
+        this.platform.log.info(`Mijia HSV fragment for ${this.config.name || this.config.did}: stream=${streamId}, index=${fragmentCount}, atom=${fragment.type}, bytes=${fragment.data.length}, isLast=${isLast}`);
+      }
+      this.writeDebugRecording(session, fragment.data);
+      this.localRecorder.write(session.localRecording, fragment.data);
+      mediaTimeline.observe(fragment.data);
+      finalFragmentSent = isLast;
+      return { data: fragment.data, isLast };
+    };
+    session.motionEndTimer = setInterval(() => {
+      if (!this.isMotionActive()) this.finishRecordingInput(streamId, session);
+    }, 250);
+    session.motionEndTimer.unref?.();
 
     try {
       while (true) {
+        if (session.closed || signal?.aborted) break;
+        if (!this.isMotionActive()) this.finishRecordingInput(streamId, session);
         const fragmentInfo = await nextFragmentWithTimeout(
           session,
           Math.max(Number(this.config.hsvFragmentWaitTimeoutMs || 30000), 5000),
           () => this.closeRecordingStream(streamId, "fragment-timeout"),
         );
+        // HomeKit cancellation is not a request to emit another final packet.
+        if (session.closed || signal?.aborted) break;
         if (!fragmentInfo) {
-          if (pendingFragment) {
-            emitted = true;
-            fragmentCount += 1;
-            this.metrics?.increment("hksv_fragments_total");
-            this.platform.log.info(`Mijia HSV fragment for ${this.config.name || this.config.did}: stream=${streamId}, index=${fragmentCount}, atom=${pendingFragment.type}, bytes=${pendingFragment.data.length}, isLast=true`);
-            this.writeDebugRecording(session, pendingFragment.data);
-            this.localRecorder.write(session.localRecording, pendingFragment.data);
-            finalFragmentSent = true;
-            yield { data: pendingFragment.data, isLast: true };
-            pendingFragment = null;
+          if (!session.outputEnded) {
+            throw new Error("HSV output stopped before a clean MP4 end of stream.");
           }
+          if (pendingFragment?.type !== "mdat") {
+            throw new Error("HSV output ended without a final media fragment.");
+          }
+          yield recordingPacket(pendingFragment, true);
+          pendingFragment = null;
           break;
         }
 
         if (pendingFragment) {
-          emitted = true;
-          fragmentCount += 1;
-          this.metrics?.increment("hksv_fragments_total");
-          const isLast = !this.isMotionActive();
-          if (fragmentCount <= 3 || isLast || this.config.hsvFfmpegDebug) {
-            this.platform.log.info(`Mijia HSV fragment for ${this.config.name || this.config.did}: stream=${streamId}, index=${fragmentCount}, atom=${pendingFragment.type}, bytes=${pendingFragment.data.length}, isLast=${isLast}`);
-          }
-          this.writeDebugRecording(session, pendingFragment.data);
-          this.localRecorder.write(session.localRecording, pendingFragment.data);
-          if (isLast) {
-            finalFragmentSent = true;
-          }
-          yield { data: pendingFragment.data, isLast };
-          pendingFragment = null;
-          if (isLast) {
-            this.platform.log.info(`Mijia HSV recording ending because motion stopped for ${this.config.name || this.config.did}: stream=${streamId}`);
-            break;
-          }
-        }
-
-        if (session.closed) {
-          emitted = true;
-          fragmentCount += 1;
-          this.metrics?.increment("hksv_fragments_total");
-          this.platform.log.info(`Mijia HSV fragment for ${this.config.name || this.config.did}: stream=${streamId}, index=${fragmentCount}, atom=${fragmentInfo.type}, bytes=${fragmentInfo.data.length}, isLast=true`);
-          this.writeDebugRecording(session, fragmentInfo.data);
-          this.localRecorder.write(session.localRecording, fragmentInfo.data);
-          finalFragmentSent = true;
-          yield { data: fragmentInfo.data, isLast: true };
-          break;
+          yield recordingPacket(pendingFragment, false);
+          if (session.closed || signal?.aborted) break;
         }
 
         pendingFragment = fragmentInfo;
       }
+    } catch (error) {
+      streamError = error.message;
+      throw error;
     } finally {
+      clearInterval(session.motionEndTimer);
+      clearTimeout(session.flushTimer);
       if (!emitted) {
         this.platform.log.warn(`Mijia HSV recording stream ended before emitting fragments for ${this.config.name || this.config.did}`);
       } else {
         this.platform.log.info(`Mijia HSV recording generator finished for ${this.config.name || this.config.did}: stream=${streamId}, fragments=${fragmentCount}, finalFragmentSent=${finalFragmentSent}`);
-        this.rememberCompletedStream(streamId, fragmentCount, finalFragmentSent);
+        if (finalFragmentSent && mediaFragmentCount > 0) {
+          this.rememberCompletedStream(streamId, fragmentCount, finalFragmentSent);
+        }
       }
       this.lastRecordingStream = {
         ...(this.lastRecordingStream || { streamId }),
-        status: emitted ? "completed" : "ended-without-fragments",
+        status: streamError || session.error ? "failed"
+          : finalFragmentSent && mediaFragmentCount > 0 ? "completed"
+            : mediaFragmentCount > 0 ? "interrupted" : "ended-without-media",
         completedAt: Date.now(),
         durationMs: Date.now() - startedAt,
         fragments: fragmentCount,
         finalFragmentSent,
         emitted,
+        mediaFragments: mediaFragmentCount,
+        mediaTimeline: mediaTimeline.getStatusSnapshot(),
+        inputTimeline: session.inputMuxer?.getStatusSnapshot() || null,
+        acknowledged: Boolean(session.acknowledged),
+        error: streamError || session.error || null,
         videoPackets: session.videoPackets,
         videoBytes: session.videoBytes,
         writtenVideoPackets: session.writtenVideoPackets,
@@ -302,10 +312,47 @@ class XiaomiCameraRecordingDelegate {
 
   acknowledgeStream(streamId) {
     this.platform.log.info(`Mijia HSV recording stream acknowledged for ${this.config.name || this.config.did}: stream=${streamId}`);
+    const session = this.streams.get(streamId);
+    if (session) session.acknowledged = true;
+    if (this.lastRecordingStream?.streamId === streamId) {
+      this.lastRecordingStream.acknowledged = true;
+    }
     this.closeRecordingStream(streamId, "acknowledged");
   }
 
+  finishRecordingInput(streamId, session) {
+    if (session.closed || session.inputEnded || session.outputEnded) return;
+    session.inputEnded = true;
+    clearInterval(session.motionEndTimer);
+    session.reader?.off("packet", session.onPacket);
+    session.packetUnsubscribe?.();
+    session.packetUnsubscribe = null;
+    clearInterval(session.audioSilenceTimer);
+    session.audioSilenceTimer = null;
+    this.platform.log.info(`Mijia HSV motion ended; draining remaining MP4 fragments for ${this.config.name || this.config.did}: stream=${streamId}`);
+    const flushTimeoutMs = Math.max(Number(this.config.hsvFlushTimeoutMs || 15000), 5000);
+    session.flushTimer = setTimeout(() => {
+      session.error = "Timed out draining HSV MP4 output.";
+      this.closeRecordingStream(streamId, "ffmpeg-flush-timeout");
+    }, flushTimeoutMs);
+    session.flushTimer.unref?.();
+    // end() flushes queued input bytes. SIGTERM here would discard muxer output.
+    try {
+      session.proc?.stdio?.[3]?.end();
+      session.proc?.stdio?.[4]?.end();
+    } catch (error) {
+      session.error = error.message;
+      this.closeRecordingStream(streamId, "input-end-error");
+    }
+  }
+
   isMotionActive() {
+    const motion = this.motionEventManager?.getStatusSnapshot?.();
+    // The same deadline controls the HomeKit event and the MP4 writer. A
+    // stale characteristic value must neither truncate nor prolong a session.
+    if (Number(motion?.recordingActiveUntil) > 0) {
+      return Date.now() < Number(motion.recordingActiveUntil);
+    }
     let homeKitMotionActive = false;
     try {
       const Characteristic = this.platform.api?.hap?.Characteristic;
@@ -320,12 +367,11 @@ class XiaomiCameraRecordingDelegate {
       return true;
     }
 
-    const motion = this.motionEventManager?.getStatusSnapshot?.();
     if (motion?.motionActiveUntil) {
       const postEventMs = Math.max(Number(
         this.config.hsvPostEventMs
           ?? this.config.postEventMs
-          ?? (Number(this.config.hsvPostEventSeconds ?? 10) * 1000),
+          ?? (Number(this.config.hsvPostEventSeconds ?? 5) * 1000),
       ), 0);
       return Date.now() < Number(motion.motionActiveUntil) + postEventMs;
     }
@@ -380,7 +426,8 @@ class XiaomiCameraRecordingDelegate {
       const reasonName = this.hdsCloseReasonName(reason);
       const completed = !session ? this.completedStreams.get(streamId) : null;
       if (!session && completed) {
-        this.platform.log.info("Mijia HSV close requested by HomeKit after completed recording for " + (this.config.name || this.config.did) + ": stream=" + streamId + ", reason=" + reasonName + ", fragments=" + completed.fragments + ", finalFragmentSent=" + completed.finalFragmentSent);
+        if (this.lastRecordingStream?.streamId === streamId) this.lastRecordingStream.closeReason = reasonName;
+        this.platform.log.info("Mijia HSV close requested by HomeKit after final fragment for " + (this.config.name || this.config.did) + ": stream=" + streamId + ", reason=" + reasonName + ", fragments=" + completed.fragments + ", finalFragmentSent=" + completed.finalFragmentSent);
         return;
       }
       this.platform.log.info("Mijia HSV close requested by HomeKit for " + (this.config.name || this.config.did) + ": stream=" + streamId + ", reason=" + reasonName);
@@ -393,6 +440,8 @@ class XiaomiCameraRecordingDelegate {
     session.closeReason = reason !== undefined ? this.hdsCloseReasonName(reason) : session.closeReason || "close";
     this.platform.log.info(`Closing Mijia HSV recording stream ${streamId} for ${this.config.name || this.config.did}${reason !== undefined ? `: reason=${reason}` : ""}`);
     clearTimeout(session.closeTimer);
+    clearInterval(session.motionEndTimer);
+    clearTimeout(session.flushTimer);
     while (session.fragmentWaiters?.length) {
       const resolve = session.fragmentWaiters.shift();
       resolve?.(null);
@@ -403,6 +452,10 @@ class XiaomiCameraRecordingDelegate {
       session.reader?.off("error", session.onReaderError);
       if (session.reader) {
         this.streamingDelegate.markHksvReaderInactive?.(session.recordingVideoQuality);
+      }
+      if (session.pausedMonitoringForHksv) {
+        this.streamingDelegate.resumeBackgroundMonitoring?.(`hksv-recording-ended:${streamId}`);
+        session.pausedMonitoringForHksv = false;
       }
       session.packetUnsubscribe?.();
       session.packetUnsubscribe = null;
@@ -499,15 +552,45 @@ class XiaomiCameraRecordingDelegate {
     return String(reason);
   }
 
+  selectRecordingPrebuffer(packets, now = Date.now()) {
+    if (!Array.isArray(packets) || !packets.length) return [];
+    const latest = packets[packets.length - 1]?.createdAt;
+    // An old GOP is useful as a still, but is not a continuous recording
+    // prebuffer. Replaying it after a disconnected SD interval creates an
+    // artificial video hole and several seconds of audio-only MP4 fragments.
+    if (!Number.isFinite(latest) || now - latest > 1000 || latest - now > 1000) return [];
+    for (let i = 0; i < packets.length; i += 1) {
+      const packet = packets[i];
+      if (packet?.codec !== "h264" || !packet.payload?.length || !Number.isFinite(packet.createdAt)) return [];
+      if (i > 0) {
+        const gap = packet.createdAt - packets[i - 1].createdAt;
+        if (gap < 0 || gap > 1000) return [];
+      }
+    }
+    return hasH264DecodableFrame(packets) ? packets : [];
+  }
+
   async startRecordingSession(streamId, signal) {
-    const recordingVideoQuality = this.streamingDelegate.videoQualityForPurpose?.("hsv") || null;
+    await this.streamingDelegate.prepareForHksvRecording?.(`hksv-recording:${streamId}`);
+    const recordingVideoQuality = this.streamingDelegate.recordingVideoQualityForCurrentState?.()
+      || this.streamingDelegate.videoQualityForPurpose?.("hsv")
+      || null;
     const lowResourceRecordingQuality = recordingVideoQuality === "sd" || recordingVideoQuality === "sub";
-    const usePacketObserver = this.config.hsvUsePacketObserver !== false && lowResourceRecordingQuality;
+    const hasSharedPacketSource = this.streamingDelegate.hasActivePacketSourceForQuality?.(recordingVideoQuality) === true;
+    // Subscribe once to the ref-counted media reader. Acquiring the same quality
+    // reuses the camera connection and supplies real audio, even if Live closes.
+    // Per-viewer packet observers duplicate video when several viewers are open.
+    const usePacketObserver = this.config.hsvUsePacketObserver === true && (lowResourceRecordingQuality || hasSharedPacketSource);
     if (!usePacketObserver && this.config.hsvUsePacketObserver === true && !lowResourceRecordingQuality) {
       this.platform.log.info(`Mijia HSV using dedicated MAIN reader for ${this.config.name || this.config.did}: quality=${recordingVideoQuality || "default"}, audio=true`);
     }
     if (!usePacketObserver) {
       this.streamingDelegate.markHksvReaderActive?.(recordingVideoQuality);
+    }
+    const liveQuality = this.streamingDelegate.videoQualityForPurpose?.("live");
+    const pausedMonitoringForHksv = !usePacketObserver && recordingVideoQuality === liveQuality;
+    if (pausedMonitoringForHksv) {
+      await this.streamingDelegate.pauseBackgroundMonitoring?.(`hksv-recording:${streamId}`);
     }
     const reader = usePacketObserver
       ? null
@@ -519,6 +602,10 @@ class XiaomiCameraRecordingDelegate {
       packetUnsubscribe: null,
       audioSilenceTimer: null,
       closed: false,
+      inputEnded: false,
+      outputEnded: false,
+      motionEndTimer: null,
+      flushTimer: null,
       onPacket: null,
       onReaderError: null,
       closeTimer: null,
@@ -544,15 +631,21 @@ class XiaomiCameraRecordingDelegate {
       recordingVideoQuality,
       closeReason: null,
       fragmentStreamPromise: proc.fragmentStreamPromise || null,
+      pausedMonitoringForHksv,
     };
 
     const videoPipe = proc.stdio[3];
-    const audioPipe = proc.stdio[4];
+    const inputMuxer = new HsvMatroskaInput({
+      sampleRate: normalizeMissAudioSampleRate(this.config.missAudioSampleRate, this.config.model),
+      width: Number(this.config.nativeVideoWidth || 1920),
+      height: Number(this.config.nativeVideoHeight || 1080),
+    });
+    session.inputMuxer = inputMuxer;
     const startupPackets = [];
     let pipePrimed = false;
 
     const safeWrite = (pipe, payload) => {
-      if (!pipe || pipe.destroyed || !pipe.writable || session.closed) {
+      if (!payload?.length || !pipe || pipe.destroyed || !pipe.writable || session.closed) {
         return false;
       }
       try {
@@ -563,33 +656,34 @@ class XiaomiCameraRecordingDelegate {
         return false;
       }
     };
+    const writeMedia = (kind, packet) => {
+      if (session.error) return false;
+      try {
+        return safeWrite(videoPipe, inputMuxer[kind](packet));
+      } catch (error) {
+        session.error = error.message;
+        this.platform.log.warn(`Mijia HSV timestamped input failed for ${this.config.name || this.config.did}: ${error.message}`);
+        // Initial prebuffer writes happen before streams.set() below.
+        queueMicrotask(() => this.closeRecordingStream(streamId, "input-mux-error"));
+        return false;
+      }
+    };
 
-    const prebufferPackets = this.streamingDelegate.getVideoPrebufferPackets?.({
+    const prebufferCandidates = this.streamingDelegate.getVideoPrebufferPackets?.({
       videoQuality: recordingVideoQuality,
       allowMixedQuality: this.config.hsvAllowMixedQualityPrebuffer === true,
     }) || [];
+    const prebufferPackets = this.selectRecordingPrebuffer(prebufferCandidates);
+    if (prebufferCandidates.length && !prebufferPackets.length) {
+      this.platform.log.info(`Mijia HSV skipped stale or discontinuous prebuffer for ${this.config.name || this.config.did}: stream=${streamId}, packets=${prebufferCandidates.length}`);
+    }
     if (prebufferPackets.length) {
-      const firstPacketAt = Number(prebufferPackets[0]?.createdAt || 0);
-      const lastPacketAt = Number(prebufferPackets.at(-1)?.createdAt || 0);
-      const inputFrameMs = 1000 / Math.max(Number(this.config.hsvInputFps || 20), 1);
-      const targetPrebufferMs = Math.max(Number(this.config.prebufferSeconds || this.config.hsvPrebufferSeconds || 6) * 1000, 0);
-      const gopLookbackMs = Math.max(Number(this.config.hsvPrebufferGopLookbackMs ?? 4000), 0);
-      const maximumPrebufferMs = targetPrebufferMs + gopLookbackMs;
-      const prebufferAudioMs = Math.min(Math.max(lastPacketAt - firstPacketAt + inputFrameMs, 0), maximumPrebufferMs);
-      const missAudioSampleRate = normalizeMissAudioSampleRate(this.config.missAudioSampleRate, this.config.model);
-      const prebufferAudioBytes = Math.round(missAudioSampleRate * prebufferAudioMs / 1000);
-      if (prebufferAudioBytes > 0 && safeWrite(audioPipe, Buffer.alloc(prebufferAudioBytes, 0xd5))) {
-        session.prebufferAudioMs = Math.round(prebufferAudioMs);
-        session.prebufferAudioBytes = prebufferAudioBytes;
-        session.writtenAudioPackets += Math.ceil(prebufferAudioMs / 20);
-        session.writtenAudioBytes += prebufferAudioBytes;
-        this.metrics?.increment("hksv_recording_audio_packets_written_total", Math.ceil(prebufferAudioMs / 20));
-        this.metrics?.increment("hksv_recording_audio_bytes_written_total", prebufferAudioBytes);
-      }
+      // Original capture timestamps survive a burst replay. The audio track
+      // starts at its real offset; aresample pads the earlier video with silence.
       pipePrimed = true;
       session.pipePrimed = true;
       for (const prebufferPacket of prebufferPackets) {
-        if (safeWrite(videoPipe, prebufferPacket.payload)) {
+        if (writeMedia("video", prebufferPacket)) {
           session.writtenVideoPackets += 1;
           session.writtenVideoBytes += prebufferPacket.payload?.length || 0;
           this.metrics?.increment("hksv_recording_video_packets_written_total");
@@ -603,7 +697,15 @@ class XiaomiCameraRecordingDelegate {
     }
 
     session.onPacket = (packet) => {
+      if (session.closed || session.inputEnded) return;
+      const capturedPacket = Number.isFinite(packet.createdAt) ? packet : { ...packet, createdAt: Date.now() };
       if (packet.codec === "h264") {
+        // SD monitoring is paused while this shared HD source is recording.
+        // Keep detecting real movement so the event's hold time can extend.
+        this.streamingDelegate.observeMotionPacket?.(packet);
+        this.streamingDelegate.feedSnapshotFromPacket?.(packet, undefined, { videoQuality: recordingVideoQuality })?.catch((error) => {
+          this.platform.log.debug(`Could not update Mijia snapshot from HSV packets: ${error.message}`);
+        });
         session.videoPackets += 1;
         session.videoBytes += packet.payload?.length || 0;
         this.metrics?.increment("hksv_recording_video_packets_total");
@@ -616,7 +718,7 @@ class XiaomiCameraRecordingDelegate {
           if (hasH264ParameterSet(packet, 7)) {
             startupPackets.length = 0;
           }
-          startupPackets.push(packet);
+          startupPackets.push(capturedPacket);
           session.startupBuffered = startupPackets.length;
           const maxPackets = this.config.hsvStartupMaxPacketBuffer || 180;
           if (startupPackets.length > maxPackets) {
@@ -629,7 +731,7 @@ class XiaomiCameraRecordingDelegate {
           pipePrimed = true;
           session.pipePrimed = true;
           for (const startupPacket of startupPackets) {
-            if (safeWrite(videoPipe, startupPacket.payload)) {
+            if (writeMedia("video", startupPacket)) {
               session.writtenVideoPackets += 1;
               session.writtenVideoBytes += startupPacket.payload?.length || 0;
               this.metrics?.increment("hksv_recording_video_packets_written_total");
@@ -641,7 +743,7 @@ class XiaomiCameraRecordingDelegate {
           session.startupBuffered = 0;
           return;
         }
-        if (safeWrite(videoPipe, packet.payload)) {
+        if (writeMedia("video", capturedPacket)) {
           session.writtenVideoPackets += 1;
           session.writtenVideoBytes += packet.payload?.length || 0;
           this.metrics?.increment("hksv_recording_video_packets_written_total");
@@ -657,7 +759,7 @@ class XiaomiCameraRecordingDelegate {
         this.metrics?.increment("hksv_recording_audio_packets_total");
         this.metrics?.increment("hksv_recording_audio_bytes_total", packet.payload?.length || 0);
         this.metrics?.recordStreamPacket("hksv_audio_stream", packet.payload?.length || 0);
-        if (safeWrite(audioPipe, packet.payload)) {
+        if (writeMedia("audio", capturedPacket)) {
           session.writtenAudioPackets += 1;
           session.writtenAudioBytes += packet.payload?.length || 0;
           this.metrics?.increment("hksv_recording_audio_packets_written_total");
@@ -686,7 +788,6 @@ class XiaomiCameraRecordingDelegate {
     });
 
     videoPipe?.on("error", () => {});
-    audioPipe?.on("error", () => {});
     if (usePacketObserver) {
       session.packetUnsubscribe = this.streamingDelegate.addPacketObserver?.((packet, context = {}) => {
         const packetQuality = context.videoQuality || context.quality || null;
@@ -702,7 +803,7 @@ class XiaomiCameraRecordingDelegate {
       });
       this.platform.log.info(`Mijia HSV packet observer attached for ${this.config.name || this.config.did}: stream=${streamId}, quality=${recordingVideoQuality || "any"}`);
       if (this.config.hsvSilentAudioForObserver !== false) {
-        this.startSilentAudio(session, audioPipe);
+        this.startSilentAudio(session, (packet) => writeMedia("audio", packet));
       }
     } else {
       reader.on("packet", session.onPacket);
@@ -730,7 +831,7 @@ class XiaomiCameraRecordingDelegate {
     return session;
   }
 
-  startSilentAudio(session, audioPipe) {
+  startSilentAudio(session, writeAudio) {
     const sampleRate = normalizeMissAudioSampleRate(this.config.missAudioSampleRate, this.config.model);
     const frameMs = 20;
     const frameBytes = Math.max(1, Math.round(sampleRate * frameMs / 1000));
@@ -741,11 +842,12 @@ class XiaomiCameraRecordingDelegate {
         session.audioSilenceTimer = null;
         return;
       }
-      if (audioPipe?.writable && !audioPipe.destroyed) {
+      if (!session.inputEnded) {
         try {
-          audioPipe.write(payload);
-          session.writtenAudioPackets += 1;
-          session.writtenAudioBytes += payload.length;
+          if (writeAudio({ codec: "pcma", payload, createdAt: Date.now() })) {
+            session.writtenAudioPackets += 1;
+            session.writtenAudioBytes += payload.length;
+          }
         } catch (_error) {
           // Ignore ffmpeg pipe teardown races.
         }
@@ -761,6 +863,7 @@ class XiaomiCameraRecordingDelegate {
     }
     session.drainStarted = true;
     let pending = [];
+    let reachedEof = false;
     (async () => {
       try {
         const fragmentStream = session.fragmentStreamPromise
@@ -798,12 +901,16 @@ class XiaomiCameraRecordingDelegate {
             this.platform.log.info(`Mijia HSV queued fMP4 atom for ${this.config.name || this.config.did}: stream=${streamId}, atom=${atom.type}, bytes=${data.length}, queue=${session.fragmentQueue.length}`);
           }
         }
+        reachedEof = !session.closed;
       } catch (error) {
         if (!session.closed) {
+          session.error = error.message;
           this.platform.log.warn(`Mijia HSV fMP4 drain failed for ${this.config.name || this.config.did}: ${error.message}`);
           this.closeRecordingStream(streamId, "drain-error");
         }
       } finally {
+        session.outputEnded = reachedEof;
+        if (reachedEof) clearTimeout(session.flushTimer);
         pushFragment(session, null);
       }
     })();
@@ -829,7 +936,6 @@ class XiaomiCameraRecordingDelegate {
         || iFrameInterval
         || 4000,
     ), 500);
-    const inputFps = Number(this.config.hsvInputFps || 20);
     const keyframeSeconds = Math.max(fragmentDurationMs / 1000, 0.5);
     const keyframeInterval = Math.max(Math.round(fps * keyframeSeconds), 1);
     const fragmentOutput = await createFragmentTcpOutput();
@@ -838,26 +944,20 @@ class XiaomiCameraRecordingDelegate {
       "-hide_banner",
       "-loglevel",
       this.config.hsvFfmpegDebug ? "info" : "warning",
-      "-fflags",
-      "+genpts",
-      "-r",
-      String(inputFps),
+      "-probesize",
+      "32768",
+      "-analyzeduration",
+      "100000",
+      "-fpsprobesize",
+      "0",
       "-f",
-      "h264",
+      "matroska",
       "-i",
       "pipe:3",
-      "-f",
-      "alaw",
-      "-ar",
-      String(missAudioSampleRate),
-      "-ac",
-      "1",
-      "-i",
-      "pipe:4",
       "-map",
       "0:v:0",
       "-map",
-      "1:a:0",
+      "0:a:0",
       "-dn",
       "-sn",
       ...recordingVideoArgs(this.config, fps, keyframeInterval, width, height, bitrate, keyframeSeconds),
@@ -889,7 +989,7 @@ class XiaomiCameraRecordingDelegate {
     ];
 
     this.platform.log.info(`Starting Mijia HSV ffmpeg for ${this.config.name || this.config.did}: stream=${streamId}, ${width}x${height}@${fps}, videoCodec=${recordingVideoCodec(this.config)}, audioIn=${missAudioSampleRate}, audioOut=${audioSampleRate}, output=tcp:${fragmentOutput.port}`);
-    const proc = spawn(ffmpeg, args, { stdio: ["ignore", "ignore", "pipe", "pipe", "pipe"] });
+    const proc = spawn(ffmpeg, args, { stdio: ["ignore", "ignore", "pipe", "pipe"] });
     proc.fragmentServer = fragmentOutput.server;
     proc.fragmentStreamPromise = fragmentOutput.streamPromise.then((socket) => {
       proc.fragmentSocket = socket;
@@ -1060,7 +1160,7 @@ function defaultHsvEncodeHeight(config, videoCodec) {
   return videoCodec.resolution[1] || 720;
 }
 
-async function readLength(stream, length) {
+async function readLength(stream, length, allowEnd = false) {
   if (!length) {
     return Buffer.alloc(0);
   }
@@ -1078,17 +1178,24 @@ async function readLength(stream, length) {
       }
       continue;
     }
+    if (stream.readableEnded) {
+      if (allowEnd && remaining === length) return null;
+      throw new Error("Truncated FFmpeg fragmented MP4 output.");
+    }
     await waitForReadable(stream);
   }
   return Buffer.concat(chunks, length);
 }
 
 function waitForReadable(stream) {
+  if (stream.readableEnded) return Promise.resolve();
+  if (stream.destroyed) return Promise.reject(new Error("FFmpeg fragmented MP4 stream closed."));
   return new Promise((resolve, reject) => {
     const cleanup = () => {
       stream.off("readable", onReadable);
       stream.off("close", onClose);
       stream.off("error", onError);
+      stream.off("end", onEnd);
     };
     const onReadable = () => {
       cleanup();
@@ -1096,7 +1203,12 @@ function waitForReadable(stream) {
     };
     const onClose = () => {
       cleanup();
-      reject(new Error("FFmpeg fragmented MP4 stream closed."));
+      if (stream.readableEnded) resolve();
+      else reject(new Error("FFmpeg fragmented MP4 stream closed."));
+    };
+    const onEnd = () => {
+      cleanup();
+      resolve();
     };
     const onError = (error) => {
       cleanup();
@@ -1105,14 +1217,25 @@ function waitForReadable(stream) {
     stream.once("readable", onReadable);
     stream.once("close", onClose);
     stream.once("error", onError);
+    stream.once("end", onEnd);
   });
 }
 
 async function* parseFragmentedMP4(stream) {
   while (true) {
-    const header = await readLength(stream, 8);
-    const length = header.readInt32BE(0) - 8;
+    let header = await readLength(stream, 8, true);
+    if (!header) return;
+    let size = header.readUInt32BE(0);
     const type = header.slice(4).toString();
+    if (size === 1) {
+      const extended = await readLength(stream, 8);
+      size = Number(extended.readBigUInt64BE(0));
+      header = Buffer.concat([header, extended]);
+    }
+    if (!Number.isSafeInteger(size) || size < header.length || size > 64 * 1024 * 1024) {
+      throw new Error("Invalid FFmpeg fragmented MP4 atom length.");
+    }
+    const length = size - header.length;
     const data = await readLength(stream, length);
     yield { header, length, type, data };
   }

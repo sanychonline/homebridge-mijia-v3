@@ -46,6 +46,10 @@ class CameraStateMachine {
 
   recordingStopped(reason = "recording-stopped") {
     this.recordingSessions = Math.max(this.recordingSessions - 1, 0);
+    if (this.liveSessions > 0 || this.talkActive) {
+      this.recompute(reason);
+      return;
+    }
     this.enterCooldown(reason);
   }
 
@@ -66,6 +70,10 @@ class CameraStateMachine {
     this.motionActive = false;
     clearTimeout(this.motionClearTimer);
     this.motionClearTimer = null;
+    if (this.liveSessions > 0 || this.recordingSessions > 0 || this.talkActive) {
+      this.recompute(reason);
+      return;
+    }
     this.enterCooldown(reason);
   }
 
@@ -84,12 +92,12 @@ class CameraStateMachine {
       this.transition(STATES.TALK_ACTIVE, reason);
       return;
     }
-    if (this.recordingSessions > 0) {
-      this.transition(STATES.RECORDING, reason);
-      return;
-    }
     if (this.liveSessions > 0) {
       this.transition(STATES.LIVE_VIEW, reason);
+      return;
+    }
+    if (this.recordingSessions > 0) {
+      this.transition(STATES.RECORDING, reason);
       return;
     }
     if (this.motionActive) {

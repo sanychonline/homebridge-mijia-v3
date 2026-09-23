@@ -19,6 +19,7 @@ class MotionEventManager {
     this.motionClearTimer = null;
     this.cooldownTimer = null;
     this.motionActiveUntil = 0;
+    this.lastMotionAt = 0;
     this.lastEventAt = 0;
     this.eventCount = 0;
   }
@@ -38,15 +39,22 @@ class MotionEventManager {
     const now = Date.now();
     const cooldownMs = Math.max(Number(this.config.motionCooldownMs ?? (Number(this.config.motionCooldownSeconds || 10) * 1000)), 0);
     const holdMs = Math.max(Number(durationMs || this.config.hsvMotionDurationMs || this.config.motionHoldMs || 15000), 1000);
+    this.lastMotionAt = now;
+
+    // Cooldown aggregates events, not the time for which actual motion is
+    // active. A failed recording must not leave its old deadline in charge
+    // of a subsequent recording while fresh motion is still arriving.
+    const clearAt = now + holdMs;
+    this.motionActiveUntil = Math.max(this.motionActiveUntil, clearAt);
+    const { Characteristic } = this.platform.api.hap;
+    this.motionService.updateCharacteristic(Characteristic.MotionDetected, true);
 
     if (this.state === STATES.COOLDOWN && now - this.lastEventAt < cooldownMs) {
+      this.scheduleMotionClear();
       this.metrics?.increment("motion_events_aggregated_total");
       this.platform.log.info(`motion.trigger.aggregated camera=${this.cameraName()} state=${this.state} cooldownRemainingMs=${Math.max(cooldownMs - (now - this.lastEventAt), 0)}`);
       return false;
     }
-
-    const clearAt = now + holdMs;
-    this.motionActiveUntil = Math.max(this.motionActiveUntil, clearAt);
 
     if (this.state === STATES.MOTION_DETECTED || this.state === STATES.PREPARING_RECORDING || this.state === STATES.RECORDING) {
       this.metrics?.increment("motion_events_extended_total");
@@ -60,8 +68,6 @@ class MotionEventManager {
     this.lastEventAt = now;
     this.transition(STATES.MOTION_DETECTED, "motion-detected");
 
-    const { Characteristic } = this.platform.api.hap;
-    this.motionService.updateCharacteristic(Characteristic.MotionDetected, true);
     this.transition(STATES.PREPARING_RECORDING, "homekit-motion-notified");
     this.scheduleMotionClear();
     return true;
@@ -78,14 +84,31 @@ class MotionEventManager {
     }
   }
 
+  recordingActiveUntil() {
+    if (!this.motionActiveUntil) return 0;
+    const postEventMs = Math.max(Number(
+      this.config.hsvPostEventMs
+        ?? this.config.postEventMs
+        ?? (Number(this.config.hsvPostEventSeconds ?? 5) * 1000),
+    ), 0);
+    return this.motionActiveUntil + postEventMs;
+  }
+
   scheduleMotionClear() {
     clearTimeout(this.motionClearTimer);
-    const delayMs = Math.max(this.motionActiveUntil - Date.now(), 1);
+    // Keep HomeKit's event active throughout the recording tail. New motion
+    // during that tail extends this session without a false/true edge.
+    const delayMs = Math.max(this.recordingActiveUntil() - Date.now(), 1);
     this.motionClearTimer = setTimeout(() => this.clearMotion(), delayMs);
     this.motionClearTimer.unref?.();
   }
 
   clearMotion() {
+    // A timer callback already queued before an extension is stale.
+    if (Date.now() < this.recordingActiveUntil()) {
+      this.scheduleMotionClear();
+      return;
+    }
     const { Characteristic } = this.platform.api.hap;
     try {
       this.motionService?.updateCharacteristic(Characteristic.MotionDetected, false);
@@ -132,6 +155,8 @@ class MotionEventManager {
       eventCount: this.eventCount,
       motionServiceReady: Boolean(this.motionService),
       motionActiveUntil: this.motionActiveUntil || null,
+      recordingActiveUntil: this.recordingActiveUntil() || null,
+      lastMotionAt: this.lastMotionAt || null,
       lastEventAt: this.lastEventAt || null,
     };
   }

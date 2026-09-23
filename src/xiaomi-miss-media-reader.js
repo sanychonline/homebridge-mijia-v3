@@ -93,7 +93,9 @@ class XiaomiMissMediaReader extends EventEmitter {
     await this.connection.writeCommand(CMD_AUTH_REQ, payload);
     const response = await this.readCommand();
     if (response.command !== 0x101 || !response.data.includes(Buffer.from('"result":"success"'))) {
-      throw new Error(`Xiaomi MISS auth failed for ${this.descriptor.did}.`);
+      const error = new Error(`Xiaomi MISS auth failed for ${this.descriptor.did}.`);
+      error.code = "XIAOMI_MISS_AUTH_FAILED";
+      throw error;
     }
     this.authChannel = parseAuthChannel(response.data);
   }

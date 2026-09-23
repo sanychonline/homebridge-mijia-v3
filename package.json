@@ -1,8 +1,8 @@
 {
   "name": "homebridge-mijia-v3",
-  "version": "0.1.10",
+  "version": "0.1.13",
   "displayName": "Xiaomi 1080p",
-  "description": "Experimental Homebridge camera plugin for Xiaomi/Mijia cameras using local MISS/TUTK media.",
+  "description": "Homebridge plugin for Xiaomi Mijia v3 with local video and audio, snapshots, two-way talk, and experimental HomeKit Secure Video.",
   "main": "src/index.js",
   "license": "MIT",
   "repository": {
@@ -19,9 +19,14 @@
     "tools/",
     "config.schema.json",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "SECURITY.md"
   ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "scripts": {
     "test": "node --test",
     "prepack": "npm test",

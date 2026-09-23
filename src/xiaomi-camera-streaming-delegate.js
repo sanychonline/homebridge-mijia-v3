@@ -20,6 +20,7 @@ class XiaomiCameraStreamingDelegate {
     this.snapshotCache = null;
     this.snapshotInFlight = null;
     this.snapshotRefreshTimer = null;
+    this.snapshotBuffers = new Map();
     this.liveStreamStarting = 0;
     this.preconnectedReaders = new Map();
     this.monitoringService = null;
@@ -204,6 +205,7 @@ class XiaomiCameraStreamingDelegate {
     if (!session) {
       throw new Error("Missing prepared HomeKit stream session.");
     }
+    session.lastStreamRequest = request;
 
     const activeStreams = this.activeStreamCount(request.sessionID);
     if (activeStreams >= this.maxStreams) {
@@ -223,11 +225,17 @@ class XiaomiCameraStreamingDelegate {
       const streamPurpose = this.livePurposeForRequest(request);
       if (streamPurpose === "live") {
         await this.pauseBackgroundMonitoring(`homekit-live:${request.sessionID}`);
+        session.pausedMonitoringForMain = true;
       }
       const preconnectedReader = await this.claimPreconnectedReader(request.sessionID, streamPurpose);
       const stream = preconnectedReader
         ? { reader: preconnectedReader }
         : await this.resolveInputStream(streamPurpose);
+
+      if (this.sessions.get(request.sessionID) !== session) {
+        if (stream?.reader) this.releaseSharedReader(stream.reader);
+        throw new Error("HomeKit stream was cancelled while the camera was opening.");
+      }
 
       if (stream?.reader) {
         this.platform.log.info(`Selected Xiaomi MISS ${streamPurpose} stream for ${this.config.name || this.config.did}: requested=${request.video?.width || "?"}x${request.video?.height || "?"}, bitrate=${request.video?.max_bit_rate || "?"}k`);
@@ -235,6 +243,7 @@ class XiaomiCameraStreamingDelegate {
         this.stateMachine?.liveStarted(`homekit-live:${streamPurpose}`);
         session.streamPurpose = streamPurpose;
         session.process = this.spawnFfmpegFromMissReader(request, session, stream.reader, 1, streamPurpose);
+        this.scheduleLiveSubUpgrade(request, session);
         const talkbackResult = await this.talkback?.startStream?.(request, stream.reader);
         if (talkbackResult?.ok === false) {
           this.platform.log.warn(`Xiaomi talkback was not started for ${this.config.name || this.config.did}: ${talkbackResult.error}`);
@@ -242,6 +251,12 @@ class XiaomiCameraStreamingDelegate {
         this.bumpStreamWatchdog(request.sessionID, "start");
         return;
       }
+    } catch (error) {
+      if (session.pausedMonitoringForMain) {
+        session.pausedMonitoringForMain = false;
+        this.resumeBackgroundMonitoring(`homekit-start-failed:${request.sessionID}`);
+      }
+      throw error;
     } finally {
       this.liveStreamStarting = Math.max(0, this.liveStreamStarting - 1);
     }
@@ -255,6 +270,7 @@ class XiaomiCameraStreamingDelegate {
       this.platform.log.info(`Ignoring Mijia stream reconfigure for inactive session ${request.sessionID}`);
       return;
     }
+    session.lastStreamRequest = request;
 
     const nextPurpose = this.livePurposeForRequest(request, { fastStart: false });
     if (!nextPurpose || nextPurpose === session.streamPurpose) {
@@ -262,17 +278,46 @@ class XiaomiCameraStreamingDelegate {
       return;
     }
 
-    if (nextPurpose === "live") {
-      await this.pauseBackgroundMonitoring(`homekit-reconfigure:${request.sessionID}`);
-    }
+    await this.switchStreamPurpose(request, session, nextPurpose, `homekit-reconfigure:${request.sessionID}`, {
+      stopCurrentFirst: true,
+    });
+  }
 
+  async switchStreamPurpose(request, session, nextPurpose, reason, options = {}) {
+    this.clearLiveSubUpgrade(session);
+    const previousPurpose = session.streamPurpose || "unknown";
+    if (options.stopCurrentFirst) {
+      await this.stopCurrentStreamProcessForSwitch(request.sessionID, session, reason);
+      if (this.sessions.get(request.sessionID) !== session) {
+        this.platform.log.info(`Cancelled Mijia stream switch because HomeKit session ended: session=${request.sessionID}, target=${nextPurpose}`);
+        return;
+      }
+    }
+    if (nextPurpose === "live" && !session.pausedMonitoringForMain) {
+      await this.pauseBackgroundMonitoring(reason);
+      session.pausedMonitoringForMain = true;
+      this.closeIdleSharedReaderForQuality(this.videoQualityForPurpose("live-sub"), reason);
+      if (this.sessions.get(request.sessionID) !== session) {
+        this.resumeBackgroundMonitoring(`cancelled-switch:${request.sessionID}`);
+        this.platform.log.info(`Cancelled Mijia MAIN stream switch because HomeKit session ended: session=${request.sessionID}`);
+        return;
+      }
+    }
     const stream = await this.resolveInputStream(nextPurpose);
     if (!stream?.reader) {
-      throw new Error("Native Xiaomi MISS reader did not return a stream reader for reconfigure.");
+      throw new Error("Native Xiaomi MISS reader did not return a stream reader for switch.");
+    }
+    if (this.sessions.get(request.sessionID) !== session) {
+      this.releaseSharedReader(stream.reader);
+      if (nextPurpose === "live") {
+        this.resumeBackgroundMonitoring(`cancelled-switch:${request.sessionID}`);
+      }
+      this.platform.log.info(`Released switched Mijia reader because HomeKit session ended: session=${request.sessionID}, target=${nextPurpose}`);
+      return;
     }
 
     const oldProcess = session.process;
-    this.platform.log.info(`Switching Mijia stream session ${request.sessionID}: ${session.streamPurpose || "unknown"} -> ${nextPurpose}`);
+    this.platform.log.info(`Switching Mijia stream session ${request.sessionID}: ${previousPurpose} -> ${nextPurpose}`);
     session.streamPurpose = nextPurpose;
     session.process = this.spawnFfmpegFromMissReader(request, session, stream.reader, 1, nextPurpose);
     if (oldProcess && !oldProcess.killed) {
@@ -286,6 +331,137 @@ class XiaomiCameraStreamingDelegate {
       }
       oldProcess.kill("SIGTERM");
     }
+  }
+
+  scheduleLiveSubUpgrade(request, session) {
+    this.clearLiveSubUpgrade(session);
+    if (session.streamPurpose !== "live-sub" || this.config.liveSubAutoUpgrade === false) {
+      return;
+    }
+    if (!this.shouldUpgradeLiveSubRequest(request)) {
+      this.platform.log.info(`Keeping Mijia live stream on SUB for ${this.config.name || this.config.did}: session=${request.sessionID}, requested=${request.video?.width || "?"}x${request.video?.height || "?"}, bitrate=${request.video?.max_bit_rate || "?"}k`);
+      return;
+    }
+    if (session.liveSubUpgradeAttempted) {
+      return;
+    }
+    const delayMs = Math.max(Number(this.config.liveSubUpgradeDelayMs ?? 1500), 0);
+    session.liveSubUpgradeAttempted = true;
+    session.liveSubUpgradeTimer = setTimeout(() => {
+      session.liveSubUpgradeTimer = null;
+      this.upgradeLiveSubStream(request.sessionID, request).catch((error) => {
+        this.platform.log.warn(`Failed to upgrade Mijia live stream to MAIN for ${this.config.name || this.config.did}: session=${request.sessionID}, error=${error.message}`);
+      });
+    }, delayMs);
+    session.liveSubUpgradeTimer.unref?.();
+    this.platform.log.info(`Scheduled Mijia live stream MAIN upgrade for ${this.config.name || this.config.did}: session=${request.sessionID}, delayMs=${delayMs}`);
+  }
+
+  shouldUpgradeLiveSubRequest(request) {
+    if (this.config.liveSubAutoUpgrade === false) {
+      return false;
+    }
+    const video = request?.video || {};
+    const width = Number(video.width || 0);
+    const height = Number(video.height || 0);
+    const bitrate = Number(video.max_bit_rate || 0);
+    const subMaxWidth = Number(this.config.liveSubMaxWidth || 640);
+    const subMaxHeight = Number(this.config.liveSubMaxHeight || 480);
+    const subMaxBitrate = Number(this.config.liveSubMaxBitrateKbps || 700);
+    if (Number.isFinite(bitrate) && bitrate > 0) {
+      return bitrate > subMaxBitrate;
+    }
+    return (
+      (Number.isFinite(width) && width > subMaxWidth)
+      || (Number.isFinite(height) && height > subMaxHeight)
+      || (Number.isFinite(bitrate) && bitrate > subMaxBitrate)
+    );
+  }
+
+  clearLiveSubUpgrade(session) {
+    if (session?.liveSubUpgradeTimer) {
+      clearTimeout(session.liveSubUpgradeTimer);
+      session.liveSubUpgradeTimer = null;
+    }
+  }
+
+  async upgradeLiveSubStream(sessionId, request) {
+    const session = this.sessions.get(sessionId);
+    if (!session?.process || session.streamPurpose !== "live-sub") {
+      return;
+    }
+    await this.switchStreamPurpose(request, session, "live", `homekit-live-upgrade:${sessionId}`, {
+      stopCurrentFirst: true,
+    });
+    this.bumpStreamWatchdog(sessionId, "live-upgrade");
+  }
+
+  async prepareForHksvRecording(reason = "hksv-recording") {
+    const targetQuality = this.videoQualityForPurpose("hsv");
+    const mainQuality = this.videoQualityForPurpose("live");
+    if (targetQuality !== mainQuality) {
+      return;
+    }
+
+    const upgrades = [];
+    for (const [sessionId, session] of this.sessions.entries()) {
+      if (!session?.process || session.streamPurpose !== "live-sub") {
+        continue;
+      }
+      const request = session.lastStreamRequest;
+      if (!request) {
+        this.platform.log.warn(`Cannot upgrade Mijia live stream to MAIN before HSV because the HomeKit request is missing: session=${sessionId}`);
+        continue;
+      }
+      upgrades.push(
+        this.switchStreamPurpose(request, session, "live", `${reason}:${sessionId}`, {
+          stopCurrentFirst: true,
+        })
+          .then(() => this.bumpStreamWatchdog(sessionId, "hksv-recording-upgrade"))
+          .catch((error) => {
+            this.platform.log.warn(`Failed to upgrade Mijia live stream to MAIN before HSV for ${this.config.name || this.config.did}: session=${sessionId}, error=${error.message}`);
+          }),
+      );
+    }
+
+    if (upgrades.length) {
+      this.platform.log.info(`Upgrading ${upgrades.length} Mijia live stream(s) to MAIN for HD HSV recording for ${this.config.name || this.config.did}`);
+      await Promise.all(upgrades);
+    }
+  }
+
+  stopCurrentStreamProcessForSwitch(sessionId, session, reason) {
+    const proc = session?.process;
+    if (!proc || proc.killed) {
+      session.process = null;
+      return Promise.resolve();
+    }
+    session.process = null;
+    proc.expectedStopReason = reason;
+    this.platform.log.info(`Stopping current Mijia stream before switch ${sessionId}: reason=${reason}`);
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      const timeoutMs = Math.max(Number(this.config.liveSwitchStopTimeoutMs ?? 1200), 250);
+      const timer = setTimeout(finish, timeoutMs);
+      timer.unref?.();
+      proc.once("exit", finish);
+      try {
+        proc.stdio?.[3]?.end();
+        proc.audioPacer?.stop();
+        proc.stdio?.[4]?.end();
+      } catch (_error) {
+        // Ignore pipe shutdown races.
+      }
+      proc.kill("SIGTERM");
+    });
   }
 
   setMonitoringService(monitoringService) {
@@ -324,17 +500,35 @@ class XiaomiCameraStreamingDelegate {
     this.monitoringService.start();
   }
 
+  closeIdleSharedReaderForQuality(videoQuality, reason) {
+    const state = this.sharedReaderState(videoQuality);
+    if (!state?.reader || state.reader.closed || state.refs > 0) {
+      return;
+    }
+    this.platform.log.debug(`Closing idle Xiaomi MISS reader before stream switch for ${this.config.name || this.config.did}: quality=${videoQuality || "default"}, reason=${reason}`);
+    this.closeSharedReader(state.reader, reason);
+  }
+
+
   spawnFfmpegFromMissReader(request, session, reader, attempt, streamPurpose = "live") {
     const ffmpeg = this.config.ffmpeg || "ffmpeg";
     const video = request.video;
-    const targetSize = liveVideoTargetSize(this.config, video);
+    const targetSize = liveVideoTargetSize(this.config, video, streamPurpose);
     const width = targetSize.width;
     const height = targetSize.height;
     const requestedFps = Number(video.fps || 30);
     const nativeFps = Math.max(1, Number(this.config.nativeVideoFps || 20));
     const fps = Math.max(1, Math.min(requestedFps, nativeFps));
     const requestedBitrate = Number(video.max_bit_rate || 1200);
-    const bitrate = Math.max(Number(this.config.liveVideoBitrateKbps || this.config.videoBitrateKbps || 5000), requestedBitrate);
+    const configuredBitrate = Number(this.config.liveVideoBitrateKbps || this.config.videoBitrateKbps || 2200);
+    const configuredMinBitrate = Number(this.config.liveMinVideoBitrateKbps || 1200);
+    const configuredSubBitrate = Number(this.config.liveSubVideoBitrateKbps || this.config.liveSubOutputBitrateKbps || 350);
+    const bitrate = streamPurpose === "live-sub"
+      ? Math.max(96, requestedBitrate > 0 ? Math.min(requestedBitrate, configuredSubBitrate) : configuredSubBitrate)
+      : Math.min(
+          Math.max(configuredBitrate, configuredMinBitrate),
+          Math.max(configuredMinBitrate, requestedBitrate > 0 ? requestedBitrate : configuredBitrate),
+        );
     const videoCodec = String(this.config.liveVideoCodec || "copy").toLowerCase();
     const payloadType = video.pt || 99;
     const keyframeInterval = Math.max(fps * 2, 20);
@@ -347,12 +541,13 @@ class XiaomiCameraStreamingDelegate {
     diagnosticLog(this.config, `stream-start session=${request.sessionID} target=${session.address}:${session.videoPort} audioPort=${session.audioPort || "none"} includeAudio=${Boolean(session.audioPort && this.config.audio !== false)}`);
     this.platform.log.info(`Native Xiaomi MISS ffmpeg session ${request.sessionID}: videoTarget=${session.address}:${session.videoPort}, audioTarget=${session.audioPort ? `${session.address}:${session.audioPort}` : "none"}, includeAudio=${includeAudio}, videoCodec=${videoCodec}, size=${width}x${height}, requested=${video.width || "?"}x${video.height || "?"}@${requestedFps}, sourceFps=passthrough, negotiatedFps=${fps}, bitrate=${bitrate}k`);
 
+    const audioArgs = ["-hide_banner", "-loglevel", this.config.ffmpegDebug ? "info" : "warning"];
     const args = [
       "-hide_banner",
       "-loglevel",
       this.config.ffmpegDebug ? "info" : "warning",
       "-fflags",
-      "nobuffer",
+      "+discardcorrupt",
       "-flags",
       "low_delay",
       "-use_wallclock_as_timestamps",
@@ -368,7 +563,13 @@ class XiaomiCameraStreamingDelegate {
     ];
 
     if (includeAudio) {
-      args.push(
+      audioArgs.push(
+        // Raw A-law has a known format. Default probing buffers seconds of
+        // audio before the first packet can be encoded.
+        "-probesize",
+        "32",
+        "-analyzeduration",
+        "0",
         "-f",
         "alaw",
         "-ar",
@@ -376,7 +577,7 @@ class XiaomiCameraStreamingDelegate {
         "-ac",
         "1",
         "-i",
-        "pipe:4",
+        "pipe:0",
       );
     }
 
@@ -393,13 +594,23 @@ class XiaomiCameraStreamingDelegate {
     if (videoCodec !== "copy") {
       args.push(
         "-preset",
-        String(this.config.liveVideoPreset || "faster"),
+        String(streamPurpose === "live-sub"
+          ? (this.config.liveSubVideoPreset || this.config.liveVideoPreset || "veryfast")
+          : (this.config.liveVideoPreset || "faster")),
         "-tune",
         "zerolatency",
         "-pix_fmt",
         "yuv420p",
         "-fps_mode",
         "passthrough",
+        // Camera packets can arrive in bursts. The default 1/fps time base
+        // rounds distinct frames to the same RTP timestamp; keep 90 kHz precision.
+        "-enc_time_base:v",
+        "1:90000",
+        // The raw demuxer can stamp several frames with the same read time.
+        // Keep them distinct without replacing variable camera timing with CFR.
+        "-vf",
+        "settb=expr=1/90000,setpts='if(isnan(PREV_OUTPTS),PTS,max(PTS,PREV_OUTPTS+1))'",
         "-g",
         String(keyframeInterval),
         "-bf",
@@ -444,13 +655,9 @@ class XiaomiCameraStreamingDelegate {
       const requestedAudioSampleRate = normalizeRequestedAudioSampleRate(request.audio?.sample_rate, homeKitAudioSampleRate);
       const requestedAudioBitrate = Math.max(Number(request.audio?.max_bit_rate || this.config.audioBitrateKbps || 48), 16);
       const requestedAudioChannels = Math.max(Number(request.audio?.channel || 1), 1);
-      const disableAudioIndex = args.indexOf("-an");
-      if (disableAudioIndex !== -1) {
-        args.splice(disableAudioIndex, 1);
-      }
-      args.push("-map", "1:a:0");
+      audioArgs.push("-map", "0:a:0");
       if (useAacEld) {
-        args.push(
+        audioArgs.push(
           "-acodec",
           "libfdk_aac",
           "-profile:a",
@@ -467,7 +674,7 @@ class XiaomiCameraStreamingDelegate {
           `${requestedAudioBitrate}k`,
         );
       } else {
-        args.push(
+        audioArgs.push(
           "-acodec",
           "libopus",
           "-application",
@@ -486,7 +693,7 @@ class XiaomiCameraStreamingDelegate {
           `${requestedAudioBitrate}k`,
         );
       }
-      args.push(
+      audioArgs.push(
           "-payload_type",
           String(audioPayloadType),
           "-ssrc",
@@ -509,12 +716,48 @@ class XiaomiCameraStreamingDelegate {
         );
     }
 
-    const stdio = includeAudio
-      ? ["ignore", "ignore", "pipe", "pipe", "pipe"]
-      : ["ignore", "ignore", "pipe", "pipe"];
-    const proc = spawn(ffmpeg, args, { stdio });
+    const proc = spawn(ffmpeg, args, { stdio: ["ignore", "ignore", "pipe", "pipe"] });
     proc.reader = reader;
     const ffmpegStderr = [];
+
+    if (includeAudio) {
+      // Independent encoders prevent video demux scheduling from holding back
+      // audio and then emitting a second of sound at once. Both use one reader.
+      const audioProc = spawn(ffmpeg, audioArgs, { stdio: ["pipe", "ignore", "pipe"] });
+      proc.audioProcess = audioProc;
+      // Existing stop/restart paths close this delegate's audio input slot.
+      proc.stdio[4] = audioProc.stdin;
+      audioProc.stderr.on("error", () => {});
+      audioProc.stderr.on("data", (chunk) => {
+        const line = redactLog(chunk.toString()).trim();
+        if (line) {
+          ffmpegStderr.push(`[audio] ${line}`);
+          if (ffmpegStderr.length > 12) ffmpegStderr.shift();
+          if (this.config.ffmpegDebug) this.platform.log.info(`[ffmpeg audio] ${line}`);
+        }
+      });
+      audioProc.on("error", (error) => {
+        this.metrics?.increment("homekit_live_ffmpeg_errors_total");
+        this.platform.log.warn(`Failed to launch Mijia Live audio encoder: ${error.message}`);
+        proc.kill("SIGTERM");
+      });
+      audioProc.on("exit", () => {
+        if (!proc.expectedStopReason && proc.exitCode === null && proc.signalCode === null) {
+          this.platform.log.warn(`Mijia Live audio encoder exited unexpectedly for ${this.config.name || this.config.did}`);
+          proc.kill("SIGTERM");
+        }
+      });
+      proc.once("exit", () => {
+        if (audioProc.exitCode !== null || audioProc.signalCode !== null) return;
+        audioProc.stdin.end();
+        audioProc.kill("SIGTERM");
+        const killTimer = setTimeout(() => {
+          if (audioProc.exitCode === null && audioProc.signalCode === null) audioProc.kill("SIGKILL");
+        }, 1000);
+        killTimer.unref?.();
+        audioProc.once("exit", () => clearTimeout(killTimer));
+      });
+    }
 
     proc.on("error", (error) => {
       this.metrics?.increment("homekit_live_ffmpeg_errors_total");
@@ -540,8 +783,10 @@ class XiaomiCameraStreamingDelegate {
     const audioPipe = includeAudio ? proc.stdio[4] : null;
     const audioPacer = includeAudio && this.config.audioPacer !== false
       ? new AudioPacer(audioPipe, missAudioSampleRate, {
-          maxBufferedMs: this.config.audioPacerMaxBufferedMs ?? 240,
-          startupDelayMs: this.config.audioPacerStartupDelayMs ?? 40,
+          maxBufferedMs: this.config.audioPacerMaxBufferedMs ?? 1800,
+          minDelayMs: this.config.audioPacerMinDelayMs ?? 1,
+          startupDelayMs: this.config.audioPacerStartupDelayMs ?? 80,
+          targetBufferedMs: this.config.audioPacerTargetBufferedMs ?? 160,
           log: this.platform.log,
           name: this.config.name || this.config.did,
         })
@@ -557,6 +802,28 @@ class XiaomiCameraStreamingDelegate {
     const videoStartupPackets = [];
     const videoPipeMaxBufferBytes = Math.max(Number(this.config.videoPipeMaxBufferBytes ?? 262144), 65536);
     const audioPipeMaxBufferBytes = Math.max(Number(this.config.audioPipeMaxBufferBytes ?? 32768), 8192);
+
+    // A second viewer can decode immediately from the latest complete GOP of
+    // the already-open reader instead of waiting for the next camera keyframe.
+    // Bound replay size so priming cannot fill the pipe and trigger frame drops.
+    const cachedPackets = this.getVideoPrebufferPackets({
+      videoQuality: this.videoQualityForPurpose(streamPurpose),
+    });
+    let cachedGopStart = -1;
+    for (let i = cachedPackets.length - 1; i >= 0; i -= 1) {
+      if (hasH264ParameterSet(cachedPackets[i], 7)) {
+        cachedGopStart = i;
+        break;
+      }
+    }
+    if (cachedGopStart >= 0) {
+      const cachedGop = cachedPackets.slice(cachedGopStart);
+      const cachedBytes = cachedGop.reduce((sum, packet) => sum + packet.payload.length, 0);
+      if (cachedBytes <= videoPipeMaxBufferBytes / 2 && hasH264DecodableFrame(cachedGop)) {
+        videoStartupPackets.push(...cachedGop);
+        this.platform.log.debug(`Primed Mijia Live from shared camera packets: packets=${cachedGop.length}, bytes=${cachedBytes}`);
+      }
+    }
 
     const onPipeError = (label) => (error) => {
       this.platform.log.debug(`native MISS ffmpeg ${label} pipe closed for ${this.config.name || this.config.did}: ${error.message}`);
@@ -604,7 +871,7 @@ class XiaomiCameraStreamingDelegate {
           }
           const minStartupPackets = this.config.videoStartupPacketCount || 3;
           if (!hasH264DecodableFrame(videoStartupPackets) || videoStartupPackets.length < minStartupPackets) {
-            this.feedSnapshotFromPacket(packet, request).catch((error) => {
+            this.feedSnapshotFromPacket(packet, request, { videoQuality: this.videoQualityForPurpose(streamPurpose) }).catch((error) => {
               this.platform.log.debug(`Could not update local Mijia snapshot from live packet: ${error.message}`);
             });
             return;
@@ -630,7 +897,7 @@ class XiaomiCameraStreamingDelegate {
           diagnosticLog(this.config, `first-video session=${request.sessionID} codec=${packet.codec} bytes=${packet.payload.length} primed=${videoPipePrimed}`);
           this.platform.log.info(`Native Xiaomi MISS first video for ${this.config.name || this.config.did}: session=${request.sessionID}, codec=${packet.codec}, primed=${videoPipePrimed}`);
         }
-        this.feedSnapshotFromPacket(packet, request).catch((error) => {
+        this.feedSnapshotFromPacket(packet, request, { videoQuality: this.videoQualityForPurpose(streamPurpose) }).catch((error) => {
           this.platform.log.debug(`Could not update local Mijia snapshot from live packet: ${error.message}`);
         });
         return;
@@ -659,12 +926,70 @@ class XiaomiCameraStreamingDelegate {
       }
     };
 
+    const restartLiveReader = (error) => {
+      const maxRestarts = Math.max(Number(this.config.liveReaderRestartAttempts ?? 2), 0);
+      if (attempt > maxRestarts || proc.expectedStopReason) {
+        this.platform.log.warn(`Native Xiaomi MISS packet reader failed for ${this.config.name || this.config.did}: ${error.message}`);
+        proc.kill("SIGTERM");
+        return;
+      }
+
+      const currentSession = this.sessions.get(request.sessionID);
+      if (currentSession?.process !== proc) {
+        proc.expectedStopReason = "stale-reader-restart";
+        proc.kill("SIGTERM");
+        return;
+      }
+
+      const nextAttempt = attempt + 1;
+      const restartDelayMs = Math.max(Number(this.config.liveReaderRestartDelayMs ?? 300), 0);
+      proc.expectedStopReason = `reader-restart:${error.message}`;
+      currentSession.process = null;
+      reader.off("packet", onPacket);
+      reader.off("error", onReaderError);
+      audioPacer?.stop();
+      try {
+        proc.stdio?.[3]?.end();
+        proc.stdio?.[4]?.end();
+      } catch (_error) {
+        // Ignore pipe shutdown races.
+      }
+      proc.kill("SIGTERM");
+
+      this.platform.log.warn(`Restarting Mijia live stream after reader failure for ${this.config.name || this.config.did}: session=${request.sessionID}, attempt=${nextAttempt}/${maxRestarts + 1}, error=${error.message}`);
+      const timer = setTimeout(async () => {
+        const latestSession = this.sessions.get(request.sessionID);
+        if (!latestSession || latestSession.process) {
+          return;
+        }
+        try {
+          const stream = await this.resolveInputStream(streamPurpose);
+          if (!stream?.reader) {
+            throw new Error("Native Xiaomi MISS reader did not return a stream reader for restart.");
+          }
+          const stillLatestSession = this.sessions.get(request.sessionID);
+          if (!stillLatestSession || stillLatestSession.process) {
+            this.releaseSharedReader(stream.reader);
+            return;
+          }
+          stillLatestSession.process = this.spawnFfmpegFromMissReader(request, stillLatestSession, stream.reader, nextAttempt, streamPurpose);
+          this.bumpStreamWatchdog(request.sessionID, `reader-restart:${nextAttempt}`);
+        } catch (restartError) {
+          this.platform.log.warn(`Failed to restart Mijia live stream for ${this.config.name || this.config.did}: session=${request.sessionID}, error=${restartError.message}`);
+          this.stopStream(request.sessionID);
+        }
+      }, restartDelayMs);
+      timer.unref?.();
+    };
+
     const onReaderError = (error) => {
       this.platform.log.warn(`Native Xiaomi MISS packet reader failed for ${this.config.name || this.config.did}: ${error.message}`);
-      proc.kill("SIGTERM");
+      restartLiveReader(error);
     };
 
     proc.on("exit", (code, signal) => {
+      const currentSession = this.sessions.get(request.sessionID);
+      const isCurrentProcess = currentSession?.process === proc;
       this.platform.log.debug(`native MISS ffmpeg exited for ${this.config.name || this.config.did}: code=${code}, signal=${signal}`);
       diagnosticLog(this.config, `stream-exit session=${request.sessionID} code=${code} signal=${signal} videoPackets=${videoPackets} audioPackets=${audioPackets} videoBackpressureDrops=${videoBackpressureDrops} audioBackpressureDrops=${audioBackpressureDrops}`);
       if (code && code !== 0 && ffmpegStderr.length && !proc.expectedStopReason) {
@@ -674,18 +999,21 @@ class XiaomiCameraStreamingDelegate {
         this.platform.log.debug(`Native Xiaomi MISS ffmpeg exited after expected stop for ${this.config.name || this.config.did}: reason=${proc.expectedStopReason}, code=${code}`);
       }
       this.metrics?.recordLiveStreamEnded();
-      this.stateMachine?.liveStopped("homekit-live-ended");
       this.metrics?.increment("homekit_live_video_packets_total", videoPackets);
       this.metrics?.increment("homekit_live_audio_packets_total", audioPackets);
       this.platform.log.info(`Native Xiaomi MISS stream ended for ${this.config.name || this.config.did}: session=${request.sessionID}, code=${code}, signal=${signal}, videoPackets=${videoPackets}, audioPackets=${audioPackets}, videoBackpressureDrops=${videoBackpressureDrops}, audioBackpressureDrops=${audioBackpressureDrops}`);
       reader.off("packet", onPacket);
       reader.off("error", onReaderError);
       audioPacer?.stop();
-      this.clearStreamWatchdog(request.sessionID);
-      const currentSession = this.sessions.get(request.sessionID);
       if (currentSession?.process === proc) {
+        const hadLiveSession = Boolean(currentSession.streamPurpose);
+        this.clearStreamWatchdog(request.sessionID);
         this.sessions.delete(request.sessionID);
-        if (streamPurpose === "live") {
+        if (hadLiveSession) {
+          this.stateMachine?.liveStopped("homekit-live-ended");
+        }
+        if (currentSession.pausedMonitoringForMain) {
+          currentSession.pausedMonitoringForMain = false;
           this.resumeBackgroundMonitoring(`homekit-live-ended:${request.sessionID}`);
         }
       }
@@ -801,12 +1129,18 @@ class XiaomiCameraStreamingDelegate {
       videoQuality: context.quality || this.videoQualityForPurpose("monitoring"),
     });
     this.observeMotionPacket(packet);
-    this.feedSnapshotFromPacket(packet).catch((error) => {
+    this.feedSnapshotFromPacket(packet, undefined, { videoQuality: context.quality || this.videoQualityForPurpose("monitoring") }).catch((error) => {
       this.platform.log.debug(`Could not update local Mijia snapshot from monitoring packet: ${error.message}`);
     });
   }
 
   observeMotionPacket(packet) {
+    if (packet?.codec !== "h264" || !packet.payload?.length) return;
+    // Live viewers and HSV receive the same packet object from their shared
+    // reader. Analyze it once, without retaining a growing packet history.
+    this.motionPacketsSeen ||= new WeakSet();
+    if (this.motionPacketsSeen.has(packet)) return;
+    this.motionPacketsSeen.add(packet);
     if (this.motionAnalyzer.enabled) {
       this.motionAnalyzer.observePacket(packet);
     } else {
@@ -1040,12 +1374,18 @@ class XiaomiCameraStreamingDelegate {
     this.releasePreconnectedReader(sessionId, "stop");
     const session = this.sessions.get(sessionId);
     const streamPurpose = session?.streamPurpose;
+    const hadLiveSession = Boolean(session?.process && streamPurpose);
+    this.clearLiveSubUpgrade(session);
     if (session?.process) {
       this.terminateStreamProcess(sessionId, session, "stop");
     }
     this.sessions.delete(sessionId);
     this.clearStreamWatchdog(sessionId);
-    if (streamPurpose === "live") {
+    if (hadLiveSession) {
+      this.stateMachine?.liveStopped("homekit-stop");
+    }
+    if (session?.pausedMonitoringForMain) {
+      session.pausedMonitoringForMain = false;
       this.resumeBackgroundMonitoring(`homekit-stop:${sessionId}`);
     }
   }
@@ -1142,14 +1482,56 @@ class XiaomiCameraStreamingDelegate {
       return this.config.liveSubVideoQuality || this.config.liveSubMissVideoQuality || subQuality;
     }
     if (purpose === "hsv" || purpose === "recording") {
-      return this.config.hsvMissVideoQuality || this.config.hsvVideoQuality || mainQuality;
+      return this.config.hsvMissVideoQuality || this.config.hsvVideoQuality || subQuality;
     }
     return this.config.liveMissVideoQuality || this.config.liveVideoQuality || mainQuality;
+  }
+
+  recordingVideoQualityForCurrentState() {
+    const hsvQuality = this.videoQualityForPurpose("hsv");
+    const liveQuality = this.videoQualityForPurpose("live");
+    if (this.hasActivePacketSourceForQuality(liveQuality)) {
+      return liveQuality;
+    }
+    const subQuality = this.videoQualityForPurpose("live-sub");
+    if (hsvQuality === subQuality && this.hasActivePacketSourceForQuality(subQuality)) {
+      return subQuality;
+    }
+    return hsvQuality;
+  }
+
+  hasActivePacketSourceForQuality(videoQuality) {
+    if (!videoQuality) {
+      return false;
+    }
+    for (const session of this.sessions.values()) {
+      if (!session?.process || !session.streamPurpose) {
+        continue;
+      }
+      if (this.videoQualityForPurpose(session.streamPurpose) === videoQuality) {
+        return true;
+      }
+    }
+    const state = this.sharedReaderState(videoQuality);
+    return Boolean(state?.reader && !state.reader.closed && state.refs > 0);
+  }
+
+  hasActiveMainLiveStream() {
+    for (const session of this.sessions.values()) {
+      if (session?.process && session.streamPurpose === "live") {
+        return true;
+      }
+    }
+    return false;
   }
 
   livePurposeForRequest(request, options = {}) {
     if (this.hksvReaderActive && this.hksvReaderQuality && this.hksvReaderQuality === this.videoQualityForPurpose("live")) {
       this.platform.log.info(`Using shared MAIN stream for live view while HSV is active for ${this.config.name || this.config.did}: quality=${this.hksvReaderQuality}`);
+      return "live";
+    }
+
+    if (this.config.liveUseSubStreamForHomeKit !== true) {
       return "live";
     }
 
@@ -1165,6 +1547,14 @@ class XiaomiCameraStreamingDelegate {
     if (
       fastStart
       && Number.isFinite(bitrate)
+      && bitrate > 0
+      && bitrate <= subMaxBitrate
+    ) {
+      return "live-sub";
+    }
+
+    if (
+      Number.isFinite(bitrate)
       && bitrate > 0
       && bitrate <= subMaxBitrate
     ) {
@@ -1304,6 +1694,8 @@ class XiaomiCameraStreamingDelegate {
       snapshot: {
         cached: Boolean(this.snapshotCache?.buffer),
         ageMs: this.snapshotCache?.createdAt ? Date.now() - this.snapshotCache.createdAt : null,
+        sourceQuality: this.snapshotCache?.videoQuality || null,
+        generatedAt: this.snapshotCache?.generatedAt || null,
         inFlight: Boolean(this.snapshotInFlight),
         backgroundRefresh: this.config.snapshotBackgroundRefresh !== false,
         monitoringPacketAgeMs: this.lastMonitoringPacketAt ? Date.now() - this.lastMonitoringPacketAt : null,
@@ -1347,9 +1739,6 @@ class XiaomiCameraStreamingDelegate {
     if (this.snapshotCache?.buffer) {
       const refreshInterval = this.config.snapshotRefreshIntervalMs ?? 10000;
       if (now - this.snapshotCache.createdAt >= refreshInterval) {
-        this.refreshSnapshotFromPrebuffer(request).catch((error) => {
-          this.platform.log.debug(`Could not refresh Mijia snapshot from prebuffer: ${error.message}`);
-        });
         this.scheduleLocalSnapshotRefresh(request);
       }
       return this.snapshotCache.buffer;
@@ -1387,65 +1776,124 @@ class XiaomiCameraStreamingDelegate {
     if (this.snapshotInFlight) {
       return;
     }
-    if (this.hasHomeKitStreamIntent()) {
+    const intervalMs = Number(this.config.snapshotRefreshIntervalMs ?? 10000);
+    if (this.snapshotCache?.buffer && Date.now() - this.snapshotCache.createdAt < intervalMs) {
       return;
     }
-    if (this.hasRecentMonitoringPackets()) {
-      return;
-    }
-    this.snapshotInFlight = this.refreshLocalSnapshot(request)
+    this.refreshSnapshotFromPrebuffer(request)
+      .then((buffer) => {
+        if (!buffer && !this.hasSharedSnapshotSource()) {
+          return this.refreshLocalSnapshot(request);
+        }
+        return buffer;
+      })
       .catch((error) => {
         this.platform.log.warn(`Failed to refresh local Mijia snapshot for ${this.config.name || this.config.did}: ${error.message}`);
-      })
-      .finally(() => {
-        this.snapshotInFlight = null;
       });
   }
 
+  hasSharedSnapshotSource() {
+    if (this.hksvReaderActive || this.backgroundPausedForMain > 0 || this.hasHomeKitStreamIntent()) {
+      return true;
+    }
+    if (this.monitoringService?.getStatusSnapshot?.().enabled) {
+      return true;
+    }
+    const shared = this.sharedReaderSummary();
+    return Boolean(shared.active || shared.opening || shared.readers?.some((reader) => reader.active || reader.opening));
+  }
+
+  getSnapshotPacketBatch() {
+    const maxAgeMs = Math.max(Number(this.config.snapshotMaxSourceAgeMs || 10000), 1000);
+    const cutoff = Date.now() - maxAgeMs;
+    let result = null;
+    const buffers = [...this.snapshotBuffers.values(), ...this.videoPrebuffers.values()];
+    for (const buffer of buffers) {
+      buffer.stats();
+      const packets = buffer.getDecodablePackets({ maxAgeMs });
+      let parameterStart = -1;
+      let hasPps = false;
+      let start = -1;
+      let frameIndex = -1;
+      for (let index = 0; index < packets.length; index += 1) {
+        const types = packets[index].nalTypes || [];
+        if (types.includes(7)) {
+          parameterStart = index;
+          hasPps = types.includes(8);
+        } else if (parameterStart >= 0 && types.includes(8)) {
+          hasPps = true;
+        }
+        if (parameterStart >= 0 && hasPps && types.includes(5)) {
+          start = parameterStart;
+          frameIndex = index;
+        }
+      }
+      if (frameIndex < 0) {
+        continue;
+      }
+      const capturedAt = packets[frameIndex].createdAt;
+      if (!Number.isFinite(capturedAt) || capturedAt < cutoff || (result && capturedAt <= result.capturedAt)) {
+        continue;
+      }
+      // One complete, recent access point from ONE quality. Never concatenate
+      // an old HD GOP and a new SD GOP or label an old frame as freshly taken.
+      result = {
+        packets: packets.slice(start, frameIndex + 1),
+        capturedAt,
+        videoQuality: packets[frameIndex].videoQuality || null,
+      };
+    }
+    return result;
+  }
+
   async refreshSnapshotFromPrebuffer(request) {
-    const quality = this.videoQualityForPurpose("snapshot");
-    const packets = this.getVideoPrebufferPackets({
-      videoQuality: quality,
-      allowMixedQuality: true,
-    });
-    if (!packets.length) {
+    if (this.snapshotInFlight) {
+      return this.snapshotInFlight;
+    }
+    const batch = this.getSnapshotPacketBatch();
+    if (!batch) {
       return null;
     }
-
+    if (this.snapshotCache?.buffer && batch.capturedAt <= this.snapshotCache.createdAt) {
+      return this.snapshotCache.buffer;
+    }
     const timeoutMs = Math.max(Number(this.config.snapshotPrebufferTimeoutMs || 4000), 1000);
-    const buffer = await withTimeout(
-      this.captureStillFrameFromPackets(packets, request),
-      timeoutMs,
-      `Snapshot prebuffer capture timed out after ${timeoutMs}ms.`,
-    );
-    this.snapshotCache = {
-      buffer,
-      createdAt: Date.now(),
-    };
-    return buffer;
+    const job = this.captureStillFrameFromPackets(batch.packets, request, { timeoutMs })
+      .then((buffer) => {
+        if (!this.snapshotCache || batch.capturedAt > this.snapshotCache.createdAt) {
+          this.snapshotCache = { buffer, createdAt: batch.capturedAt, generatedAt: Date.now(), videoQuality: batch.videoQuality };
+        }
+        return this.snapshotCache.buffer;
+      })
+      .finally(() => {
+        if (this.snapshotInFlight === job) this.snapshotInFlight = null;
+      });
+    this.snapshotInFlight = job;
+    return job;
   }
 
   async refreshLocalSnapshot(request) {
-
-    this.platform.log.debug(`Refreshing local Mijia snapshot for ${this.config.name || this.config.did}`);
-    if (this.hasHomeKitStreamIntent()) {
-      return this.snapshotCache?.buffer || placeholderJpeg();
-    }
-
-    const reader = await this.acquireSharedReader({ purpose: "snapshot" });
-
-    try {
-      if (this.hasHomeKitStreamIntent()) {
-        return this.snapshotCache?.buffer || placeholderJpeg();
+    if (this.snapshotInFlight) return this.snapshotInFlight;
+    if (this.hasSharedSnapshotSource()) return this.snapshotCache?.buffer || placeholderJpeg();
+    const job = (async () => {
+      const reader = await this.acquireSharedReader({ purpose: "snapshot" });
+      try {
+        if (this.hasHomeKitStreamIntent() || this.hksvReaderActive || this.backgroundPausedForMain > 0) {
+          return this.snapshotCache?.buffer || placeholderJpeg();
+        }
+        const capturedAt = Date.now();
+        const buffer = await this.captureStillFrameFromMissReader(reader, request);
+        this.snapshotCache = { buffer, createdAt: capturedAt, generatedAt: Date.now(), videoQuality: this.videoQualityForPurpose("snapshot") };
+        return buffer;
+      } finally {
+        this.releaseSharedReader(reader);
       }
-      const buffer = await this.captureStillFrameFromMissReader(reader, request);
-      this.snapshotCache = {
-        buffer,
-        createdAt: Date.now(),
-      };
-      return buffer;
+    })();
+    this.snapshotInFlight = job;
+    try {
+      return await job;
     } finally {
-      this.releaseSharedReader(reader);
+      if (this.snapshotInFlight === job) this.snapshotInFlight = null;
     }
   }
 
@@ -1462,57 +1910,38 @@ class XiaomiCameraStreamingDelegate {
     return Date.now() - this.lastMonitoringPacketAt <= ttlMs;
   }
 
-  async feedSnapshotFromPacket(packet, request) {
+  async feedSnapshotFromPacket(packet, request, context = {}) {
     if (this.config.updateSnapshotFromLiveStream === false) {
       return;
     }
 
-    if (packet.codec !== "h264") {
+    if (packet?.codec !== "h264" || !packet.payload?.length) {
       return;
     }
-
+    const videoQuality = context.videoQuality || packet.videoQuality || "unknown";
+    if (!this.snapshotBuffers.has(videoQuality)) {
+      this.snapshotBuffers.set(videoQuality, new CircularPacketBuffer({
+        maxAgeMs: Number(this.config.snapshotMaxSourceAgeMs || 10000),
+        maxPackets: Number(this.config.snapshotMaxPacketBuffer || 180),
+        maxBytes: 2 * 1024 * 1024,
+        gopLookbackMs: 0,
+      }));
+    }
+    // Keep the newest keyframe even while a cached JPEG is within its TTL.
+    this.snapshotBuffers.get(videoQuality).push({ ...packet, videoQuality });
     const now = Date.now();
     const ttl = this.config.snapshotTtlMs ?? 10000;
     if (this.snapshotCache && now - this.snapshotCache.createdAt < ttl) {
       return;
     }
 
-    if (this.snapshotPacketInFlight) {
+    if (this.snapshotInFlight) {
       return;
     }
-
-    if (hasH264ParameterSet(packet, 7)) {
-      this.snapshotLivePackets = [];
-    }
-
-    this.snapshotLivePackets.push(packet);
-    const maxPackets = this.config.snapshotMaxPacketBuffer || 180;
-    if (this.snapshotLivePackets.length > maxPackets) {
-      this.snapshotLivePackets.splice(0, this.snapshotLivePackets.length - maxPackets);
-    }
-
-    const minPackets = this.config.snapshotPacketCount || 60;
-    if (!hasH264DecodableFrame(this.snapshotLivePackets) || this.snapshotLivePackets.length < minPackets) {
-      return;
-    }
-
-    const packets = this.snapshotLivePackets.slice();
-    this.snapshotLivePackets = [];
-
-    this.snapshotPacketInFlight = this.captureStillFrameFromPackets(packets, request)
-      .then((buffer) => {
-        this.snapshotCache = {
-          buffer,
-          createdAt: Date.now(),
-        };
-      })
+    await this.refreshSnapshotFromPrebuffer(request)
       .catch((error) => {
         this.platform.log.debug(`Could not capture local Mijia snapshot from buffered live packets: ${error.message}`);
-      })
-      .finally(() => {
-        this.snapshotPacketInFlight = null;
       });
-    await this.snapshotPacketInFlight;
   }
 
   captureStillFrameFromMissReader(reader, request) {
@@ -1662,8 +2091,7 @@ class XiaomiCameraStreamingDelegate {
           if (startupPackets.length > maxPackets) {
             startupPackets.splice(0, startupPackets.length - maxPackets);
           }
-          const minPackets = this.config.snapshotPacketCount || 60;
-          if (!hasH264DecodableFrame(startupPackets) || startupPackets.length < minPackets) {
+          if (!hasH264DecodableFrame(startupPackets)) {
             return;
           }
           pipePrimed = true;
@@ -1690,12 +2118,12 @@ class XiaomiCameraStreamingDelegate {
     });
   }
 
-  captureStillFrameFromPackets(packets, request) {
+  captureStillFrameFromPackets(packets, request, options = {}) {
     return new Promise((resolve, reject) => {
       const ffmpeg = this.config.ffmpeg || "ffmpeg";
       const width = request?.width || request?.video?.width || this.config.snapshotWidth || 1280;
       const height = request?.height || request?.video?.height || this.config.snapshotHeight || 720;
-      const timeoutMs = this.config.snapshotTimeoutMs || 12000;
+      const timeoutMs = options.timeoutMs || this.config.snapshotTimeoutMs || 12000;
 
       const args = [
         "-hide_banner",
@@ -1848,7 +2276,19 @@ function liveVideoResolutions(config = {}) {
   ];
 }
 
-function liveVideoTargetSize(config = {}, video = {}) {
+function liveVideoTargetSize(config = {}, video = {}, streamPurpose = "live") {
+  if (streamPurpose === "live-sub") {
+    const requestedWidth = Number(video.width || config.liveSubMaxWidth || 640);
+    const requestedHeight = Number(video.height || config.liveSubMaxHeight || 360);
+    const maxWidth = Number(config.liveSubOutputMaxWidth || config.liveSubMaxWidth || 640);
+    const maxHeight = Number(config.liveSubOutputMaxHeight || config.liveSubMaxHeight || 480);
+    return capVideoSize(
+      Number.isFinite(requestedWidth) && requestedWidth > 0 ? requestedWidth : 640,
+      Number.isFinite(requestedHeight) && requestedHeight > 0 ? requestedHeight : 360,
+      Number.isFinite(maxWidth) && maxWidth > 0 ? maxWidth : 640,
+      Number.isFinite(maxHeight) && maxHeight > 0 ? maxHeight : 480,
+    );
+  }
   const mode = String(config.liveVideoResolution || "720p").toLowerCase();
   const requestedWidth = Number(video.width || 1280);
   const requestedHeight = Number(video.height || 720);
@@ -1862,6 +2302,18 @@ function liveVideoTargetSize(config = {}, video = {}) {
     width: Number.isFinite(requestedWidth) && requestedWidth > 0 ? Math.min(requestedWidth, 1280) : 1280,
     height: Number.isFinite(requestedHeight) && requestedHeight > 0 ? Math.min(requestedHeight, 720) : 720,
   };
+}
+
+function capVideoSize(width, height, maxWidth, maxHeight) {
+  const scale = Math.min(maxWidth / width, maxHeight / height, 1);
+  return {
+    width: evenVideoDimension(width * scale),
+    height: evenVideoDimension(height * scale),
+  };
+}
+
+function evenVideoDimension(value) {
+  return Math.max(2, Math.floor(value / 2) * 2);
 }
 
 function normalizeMissAudioSampleRate(value, model) {
@@ -1977,6 +2429,8 @@ class AudioPacer {
     this.pipe = pipe;
     this.sampleRate = sampleRate > 0 ? sampleRate : 8000;
     this.maxBufferedMs = Number(options.maxBufferedMs || 900);
+    this.targetBufferedMs = Number(options.targetBufferedMs || Math.min(Math.max(this.maxBufferedMs / 4, 120), 400));
+    this.minDelayMs = Number(options.minDelayMs || 4);
     this.startupDelayMs = Number(options.startupDelayMs || 120);
     this.log = options.log;
     this.name = options.name || "Xiaomi Camera";
@@ -2044,9 +2498,19 @@ class AudioPacer {
     }
 
     if (this.queue.length) {
-      this.timer = setTimeout(() => this.flushNext(), packet.durationMs);
+      this.timer = setTimeout(() => this.flushNext(), this.nextDelayMs(packet.durationMs));
       this.timer.unref?.();
     }
+  }
+
+  nextDelayMs(packetDurationMs) {
+    const durationMs = Math.max(1, Number(packetDurationMs) || 20);
+    if (!Number.isFinite(this.bufferedMs) || this.bufferedMs <= this.targetBufferedMs) {
+      return durationMs;
+    }
+    const excessMs = Math.max(0, this.bufferedMs - this.targetBufferedMs);
+    const catchUpMs = Math.min(durationMs * 0.95, Math.ceil(excessMs / 2));
+    return Math.max(this.minDelayMs, Math.round(durationMs - catchUpMs));
   }
 
   stop() {
