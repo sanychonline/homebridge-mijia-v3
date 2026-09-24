@@ -46,18 +46,6 @@
               "type": "string",
               "default": "mijia.camera.v3"
             },
-            "cloudBootstrap": {
-              "title": "MISS Descriptor Source",
-              "type": "string",
-              "default": "fallback",
-              "description": "Use cached local MISS descriptors during normal operation. If the cache is missing, fallback refreshes it once through the cached Xiaomi session. Use local only after the descriptor cache exists.",
-              "oneOf": [
-                { "title": "Use cache, fallback to Xiaomi cloud", "enum": ["fallback"] },
-                { "title": "Local cache only", "enum": ["local"] },
-                { "title": "Legacy cache-first bootstrap", "enum": ["cacheOnly"] },
-                { "title": "Always refresh from Xiaomi cloud", "enum": ["always"] }
-              ]
-            },
             "hsv": {
               "title": "HomeKit Secure Video",
               "type": "boolean",
@@ -91,31 +79,6 @@
               "type": "integer",
               "default": 5,
               "minimum": 1
-            },
-            "localHttpApi": {
-              "title": "Local Diagnostics API",
-              "type": "boolean",
-              "default": false,
-              "description": "Exposes local health/status/snapshot endpoints for troubleshooting. Leave off for normal use. Non-loopback access requires a token."
-            },
-            "localHttpHost": {
-              "title": "Local Diagnostics API Host",
-              "type": "string",
-              "default": "127.0.0.1",
-              "description": "Bind diagnostics to loopback by default. Use 0.0.0.0 only with a strong Local Diagnostics API Token."
-            },
-            "localHttpPort": {
-              "title": "Local Diagnostics API Port",
-              "type": "integer",
-              "default": 8781,
-              "minimum": 1,
-              "maximum": 65535
-            },
-            "localHttpToken": {
-              "title": "Local Diagnostics API Token",
-              "type": "string",
-              "format": "password",
-              "description": "Bearer token for protected local diagnostics/control endpoints when Local Diagnostics API is enabled."
             }
           }
         }

@@ -2,7 +2,7 @@
   "name": "homebridge-mijia-v3",
   "version": "0.1.14",
   "displayName": "Xiaomi 1080p",
-  "description": "Homebridge plugin for Xiaomi Mijia v3 with local video and audio, snapshots, two-way talk, and experimental HomeKit Secure Video.",
+  "description": "Homebridge plugin for Xiaomi Mijia v3 with local video and audio, snapshots, two-way talk, and HomeKit Secure Video.",
   "main": "src/index.js",
   "license": "MIT",
   "repository": {
@@ -30,8 +30,7 @@
   "scripts": {
     "test": "node --test",
     "prepack": "npm test",
-    "cloud:login": "node tools/cloud-login.js",
-    "cloud:login:qr": "node tools/cloud-login.js --qr"
+    "cloud:login": "node tools/cloud-login.js"
   },
   "keywords": [
     "homebridge-plugin",

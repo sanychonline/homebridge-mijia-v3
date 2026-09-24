@@ -12,8 +12,6 @@ class UiServer extends HomebridgePluginUiServer {
     super();
 
     this.onRequest("/login-to-micloud", this.loginToMiCloud.bind(this));
-    this.onRequest("/create-micloud-qr-login", this.createMiCloudQrLogin.bind(this));
-    this.onRequest("/poll-micloud-qr-login", this.pollMiCloudQrLogin.bind(this));
     this.onRequest("/get-cached-micloud-session", this.getCachedMiCloudSession.bind(this));
     this.onRequest("/clear-cached-micloud-session", this.clearCachedMiCloudSession.bind(this));
 
@@ -40,7 +38,7 @@ class UiServer extends HomebridgePluginUiServer {
       if (!username || !password) {
         return {
           success: false,
-          error: "Username and password are required for password login. Use QR login if you do not want to enter credentials.",
+          error: "Xiaomi username and password are required.",
         };
       }
 
@@ -69,55 +67,6 @@ class UiServer extends HomebridgePluginUiServer {
       return {
         success: false,
         error: `Failed to save MiCloud session: ${error.message}`,
-      };
-    }
-  }
-
-  async createMiCloudQrLogin(params = {}) {
-    const miCloud = this.createMiCloud(params.country || params.server || "de");
-    try {
-      const qrLogin = await miCloud.createQrLogin(params.locale || "zh_CN");
-      return {
-        success: true,
-        qr: qrLogin.qr,
-        lp: qrLogin.lp,
-        loginUrl: qrLogin.loginUrl,
-        timeout: qrLogin.timeout,
-        timeInterval: qrLogin.timeInterval,
-      };
-    } catch (error) {
-      return {
-        success: false,
-        error: `Failed to create MiCloud QR login: ${error.message}`,
-      };
-    }
-  }
-
-  async pollMiCloudQrLogin(params = {}) {
-    const miCloud = this.createMiCloud(params.country || params.server || "de");
-    try {
-      const qrLoginData = await miCloud.pollQrLogin(params.lp);
-      if (!qrLoginData.success) {
-        return {
-          success: false,
-          pending: true,
-          code: qrLoginData.code,
-          desc: qrLoginData.desc,
-        };
-      }
-
-      await miCloud.completeQrLogin(qrLoginData);
-      const serviceToken = miCloud.getServiceToken();
-      await this.saveCachedMiCloudSession(serviceToken);
-
-      return {
-        success: true,
-        cachedSession: this.safeSessionMetadata(serviceToken),
-      };
-    } catch (error) {
-      return {
-        success: false,
-        error: `Failed to complete MiCloud QR login: ${error.message}`,
       };
     }
   }

@@ -16,20 +16,6 @@
     </select>
   </div>
 
-  <hr>
-
-  <h4>QR Login</h4>
-  <button id="qr-create" class="btn btn-primary">Create QR Login</button>
-  <button id="qr-poll" class="btn btn-success" disabled>Poll QR Login</button>
-  <div id="qr-url" class="alert alert-info mt-3" hidden>
-    <p class="mb-2">Open the Xiaomi sign-in page, then return here and check the login status.</p>
-    <a id="qr-link" class="btn btn-primary" href="#" target="_blank" rel="noopener noreferrer">Open Xiaomi QR login</a>
-    <button id="qr-copy" class="btn btn-outline-secondary" type="button">Copy link</button>
-  </div>
-  <div id="qr-result" class="mt-3" role="status" hidden></div>
-
-  <hr>
-
   <h4>Password / 2FA Login</h4>
   <div class="form-group">
     <label>Username</label>
@@ -71,52 +57,9 @@
 
 <script>
 (() => {
-  let lp = null;
-
   const $ = (id) => document.getElementById(id);
   const request = (path, body = {}) => homebridge.request(path, body);
   const server = () => $("server").value || "de";
-
-  $("qr-create").addEventListener("click", async () => {
-    setStatus("qr-result", "info", "Creating Xiaomi QR login...");
-    try {
-      const res = await request("/create-micloud-qr-login", { server: server(), locale: "zh_CN" });
-      if (!res.success) {
-        setStatus("qr-result", "danger", "Could not create QR login", res.error);
-        return;
-      }
-      lp = res.lp;
-      $("qr-poll").disabled = false;
-      if (!renderExternalLink("qr-url", "qr-link", res.loginUrl || res.qr)) {
-        setStatus("qr-result", "danger", "Xiaomi returned an invalid login link.");
-        return;
-      }
-      setStatus("qr-result", "success", "QR login is ready", "Open the Xiaomi page, approve the login, then click Poll QR Login.");
-    } catch (error) {
-      setStatus("qr-result", "danger", "Could not create QR login", errorMessage(error));
-    }
-  });
-
-  $("qr-poll").addEventListener("click", async () => {
-    if (!lp) {
-      setStatus("qr-result", "warning", "Create a QR login first.");
-      return;
-    }
-    try {
-      const res = await request("/poll-micloud-qr-login", { server: server(), lp });
-      if (res.success) {
-        $("qr-poll").disabled = true;
-        setStatus("qr-result", "success", "Xiaomi login completed.");
-        await refreshSession();
-      } else if (res.pending) {
-        setStatus("qr-result", "warning", "Waiting for Xiaomi approval", res.desc || "Approve the login in Xiaomi, then try again.");
-      } else {
-        setStatus("qr-result", "danger", "QR login failed", res.error || res.desc);
-      }
-    } catch (error) {
-      setStatus("qr-result", "danger", "QR login failed", errorMessage(error));
-    }
-  });
 
   $("password-login").addEventListener("click", async () => {
     setStatus("login-status", "info", "Signing in to Xiaomi...");
@@ -153,8 +96,6 @@
       setStatus("login-status", "danger", "Xiaomi sign-in failed", errorMessage(error));
     }
   });
-
-  $("qr-copy").addEventListener("click", () => copyLink("qr-link", "qr-result"));
   $("verify-copy").addEventListener("click", () => copyLink("verify-link", "login-status"));
 
   $("session-refresh").addEventListener("click", refreshSession);

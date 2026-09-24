@@ -66,7 +66,7 @@ class XiaomiLocalMissClient {
   }
 
   async resolveDescriptor() {
-    const mode = this.config.cloudBootstrap || "fallback";
+    const mode = "fallback";
     const cached = mode !== "always" ? this.loadCachedDescriptor() : null;
     if (cached) {
       this.platform.log.info(`Using cached local Xiaomi MISS descriptor for ${this.config.name || this.config.did}`);
@@ -85,7 +85,7 @@ class XiaomiLocalMissClient {
   }
 
   async recoverDescriptorAfterAuthFailure(failedDescriptor) {
-    const mode = this.config.cloudBootstrap || "fallback";
+    const mode = "fallback";
     if (mode === "local") {
       const error = new Error(
         `Cached Xiaomi MISS descriptor was rejected for ${this.config.name || this.config.did}; `

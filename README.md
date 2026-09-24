@@ -9,7 +9,8 @@ Package: `homebridge-mijia-v3`. See [CHANGELOG.md](CHANGELOG.md) for release not
 - Replaces raw Xiaomi 2FA URLs with safe, clickable **Open Xiaomi verification** and **Copy link** controls in Homebridge UI.
 - Replaces raw cached-session JSON with clear ready, missing, cleared, and error states.
 - Hides internal session paths and implementation flags from the user-facing settings screen.
-- Adds concise instructions for completing password/2FA and QR login.
+- Uses a focused username/password flow with a safe, clickable Xiaomi 2FA confirmation link when required.
+- Keeps MISS descriptor refresh automatic and removes internal bootstrap and diagnostics controls from the normal configuration form.
 
 ## Version 0.1.13
 
@@ -75,7 +76,6 @@ After installation, add a platform config with:
           "model": "mijia.camera.v3",
           "ip": "192.168.1.50",
           "deviceKey": "YOUR_DEVICE_KEY",
-          "cloudBootstrap": "fallback",
           "hsv": true,
           "twoWayAudio": true,
           "powerSwitch": false
@@ -88,9 +88,7 @@ After installation, add a platform config with:
 
 The compact configuration intentionally omits stream tuning. Defaults for `mijia.camera.v3` provide MAIN `superhd`, SUB `sd`, 720p HomeKit Live output, camera audio, and five concurrent HomeKit consumers. Use `maxStreams` to change the number of Live viewers. Do not add a second camera entry just to support another viewer.
 
-`cloudBootstrap: "fallback"` reads the descriptor from `.xiaomi-1080p/miss-descriptors.json` under Homebridge's storage directory. If it is missing or the camera rejects its authentication, the plugin uses its own authenticated Xiaomi session to refresh the descriptor once and retries the local connection. Concurrent consumers share that refresh. Use the plugin settings in Homebridge UI to sign in and complete any requested verification. After a valid descriptor is cached, set `cloudBootstrap: "local"` to disallow cloud fallback for streaming.
-
-An empty installation without a cached descriptor cannot start in strict local mode using only `deviceKey`. Complete the descriptor bootstrap first. `cacheOnly` is a legacy setting and is not a substitute for `local`: if the descriptor is missing, the legacy setting can still fall back to Xiaomi Cloud.
+Use the plugin settings in Homebridge UI to sign in with your Xiaomi username and password and complete Xiaomi verification when requested. The plugin automatically obtains the camera connection metadata, stores it in the Homebridge persistent volume, and reuses the local cache. Xiaomi is contacted again only when that metadata is missing or rejected by the camera; video and audio continue to travel directly over the local network.
 
 Homebridge storage is often `/homebridge` in Docker; use your installation's actual storage directory. Keep private state in the persistent Homebridge volume, not inside the plugin's npm directory. Do not publish session files, `miss-descriptors.json`, device keys, account credentials, or debug captures. See [SECURITY.md](SECURITY.md).
 
@@ -107,16 +105,6 @@ The default fallback detects changes in video, not a physical PIR sensor. Explic
 
 A larger sensitivity value lowers the changed-pixel threshold and makes detection more sensitive. Motion tuning does not change Live or recording resolution.
 
-## Optional command-line bootstrap
-
-Homebridge UI is the preferred setup path. For command-line setup, run the helper from the installed plugin directory, with the correct Homebridge storage path:
-
-```bash
-HOMEBRIDGE_STORAGE=/homebridge npm run cloud:login:qr
-```
-
-Use this helper only when you need to create or refresh the plugin's Xiaomi session for descriptor bootstrap. It does not itself make an installation with a missing descriptor ready for strict local startup.
-
 ## External camera / HSV safety
 
 When `hsv` is enabled, the camera is published as a separate HomeKit camera accessory. Pair it with the same PIN as Homebridge. No `external` setting is required.
@@ -130,10 +118,6 @@ When `hsv` is enabled, the camera is published as a separate HomeKit camera acce
 After installing from npm or re-pairing the camera, open Apple Home camera settings and set recording to **Stream & Allow Recording**. If Apple Home leaves the camera in stream-only mode, the plugin can detect motion but HomeKit will not request HSV fragments.
 
 Do not edit Homebridge `externalAccessories` or existing CameraUI/Doorbell pairing files manually.
-
-## Local diagnostics API
-
-The local diagnostics API is disabled by default. When enabled, it binds to `127.0.0.1` unless `localHttpHost` is set manually. If you expose it on a LAN address or `0.0.0.0`, set a strong `localHttpToken`; otherwise protected endpoints fail closed.
 
 ## Camera power / privacy
 
