@@ -25,8 +25,9 @@
               "required": true
             },
             "did": {
-              "title": "Device ID",
+              "title": "Xiaomi Device ID (DID)",
               "type": "string",
+              "description": "The numeric device ID assigned to this camera in the Xiaomi/Mi Home account database. This is not the camera IP address, MAC address, serial number, or device key.",
               "required": true
             },
             "ip": {

@@ -72,7 +72,7 @@ After installation, add a platform config with:
       "cameras": [
         {
           "name": "Living Room",
-          "did": "YOUR_CAMERA_DID",
+          "did": "XIAOMI_NUMERIC_DEVICE_ID",
           "model": "mijia.camera.v3",
           "ip": "192.168.1.50",
           "deviceKey": "YOUR_DEVICE_KEY",
@@ -85,6 +85,12 @@ After installation, add a platform config with:
   ]
 }
 ```
+
+### Xiaomi Device ID (DID)
+
+`did` is the numeric device identifier assigned to the camera in the Xiaomi/Mi Home account database. It is not the camera IP address, MAC address, serial number, model name, or `deviceKey`.
+
+You can reuse the `did` shown by an existing Xiaomi integration, such as a Homebridge Miot configuration, or obtain it from the device list returned by your Xiaomi account data/API tooling. It normally looks like a long numeric value. Xiaomi login authorizes this plugin to refresh the camera connection metadata, but the current setup form does not automatically discover or fill the `did`.
 
 The compact configuration intentionally omits stream tuning. Defaults for `mijia.camera.v3` provide MAIN `superhd`, SUB `sd`, 720p HomeKit Live output, camera audio, and five concurrent HomeKit consumers. Use `maxStreams` to change the number of Live viewers. Do not add a second camera entry just to support another viewer.
 
