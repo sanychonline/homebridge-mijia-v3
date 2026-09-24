@@ -2,8 +2,15 @@
 
 ## Unreleased
 
+## 0.1.15 - 2026-09-25
+
+### Setup and documentation
+
 - Explain that `did` is the numeric Xiaomi/Mi Home database device ID and distinguish it from the IP address, MAC address, serial number, and device key.
 - Rename the Homebridge field to **Xiaomi Device ID (DID)** and add the same explanation directly to the configuration form.
+
+### Stream lifecycle
+
 - Delay SUB monitoring restart until the previous MAIN reader has completed its idle and media-stop shutdown, and cancel the pending restart when another MAIN session begins.
 
 ## 0.1.14 - 2026-09-24
