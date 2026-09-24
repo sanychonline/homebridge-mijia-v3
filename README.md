@@ -4,6 +4,13 @@ Homebridge camera platform for Xiaomi / Mijia cameras using local MISS/TUTK medi
 
 Package: `homebridge-mijia-v3`. See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
+## Version 0.1.14
+
+- Replaces raw Xiaomi 2FA URLs with safe, clickable **Open Xiaomi verification** and **Copy link** controls in Homebridge UI.
+- Replaces raw cached-session JSON with clear ready, missing, cleared, and error states.
+- Hides internal session paths and implementation flags from the user-facing settings screen.
+- Adds concise instructions for completing password/2FA and QR login.
+
 ## Version 0.1.13
 
 - Automatically refreshes a cached MISS descriptor once when the camera rejects its authentication, provided `cloudBootstrap` allows fallback and the plugin has an authenticated Xiaomi session.

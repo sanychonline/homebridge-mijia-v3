@@ -1,6 +1,6 @@
 {
   "name": "homebridge-mijia-v3",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "displayName": "Xiaomi 1080p",
   "description": "Homebridge plugin for Xiaomi Mijia v3 with local video and audio, snapshots, two-way talk, and experimental HomeKit Secure Video.",
   "main": "src/index.js",

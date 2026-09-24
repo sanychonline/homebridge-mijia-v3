@@ -21,8 +21,12 @@
   <h4>QR Login</h4>
   <button id="qr-create" class="btn btn-primary">Create QR Login</button>
   <button id="qr-poll" class="btn btn-success" disabled>Poll QR Login</button>
-  <p id="qr-url" class="mt-3"></p>
-  <pre id="qr-result" class="mt-2"></pre>
+  <div id="qr-url" class="alert alert-info mt-3" hidden>
+    <p class="mb-2">Open the Xiaomi sign-in page, then return here and check the login status.</p>
+    <a id="qr-link" class="btn btn-primary" href="#" target="_blank" rel="noopener noreferrer">Open Xiaomi QR login</a>
+    <button id="qr-copy" class="btn btn-outline-secondary" type="button">Copy link</button>
+  </div>
+  <div id="qr-result" class="mt-3" role="status" hidden></div>
 
   <hr>
 
@@ -35,22 +39,26 @@
     <label>Password</label>
     <input id="password" class="form-control" type="password" autocomplete="current-password">
   </div>
-  <div class="form-group">
-    <label>2FA Verify URL</label>
-    <input id="verify-url" class="form-control" placeholder="Filled after Xiaomi asks for 2FA">
+  <input id="verify-url" type="hidden">
+  <div id="twofa-actions" class="alert alert-warning" hidden>
+    <h5 class="alert-heading">Xiaomi verification required</h5>
+    <p>Open Xiaomi's verification page, complete the check, then enter the resulting ticket or code below.</p>
+    <a id="verify-link" class="btn btn-warning" href="#" target="_blank" rel="noopener noreferrer">Open Xiaomi verification</a>
+    <button id="verify-copy" class="btn btn-outline-secondary" type="button">Copy link</button>
   </div>
   <div class="form-group">
     <label>2FA Ticket / Code</label>
-    <input id="twofa-ticket" class="form-control">
+    <input id="twofa-ticket" class="form-control" autocomplete="one-time-code" placeholder="Enter the ticket or code after verification">
   </div>
-  <button id="password-login" class="btn btn-primary">Login</button>
+  <button id="password-login" class="btn btn-primary">Sign in</button>
+  <div id="login-status" class="mt-3" role="status" hidden></div>
 
   <hr>
 
   <h4>Cached Session</h4>
   <button id="session-refresh" class="btn btn-secondary">Refresh Session Status</button>
   <button id="session-clear" class="btn btn-danger">Clear Session</button>
-  <pre id="session-status" class="mt-2"></pre>
+  <div id="session-status" class="mt-3" role="status" hidden></div>
 </div>
 
 <div class="card card-body">
@@ -66,77 +74,185 @@
   let lp = null;
 
   const $ = (id) => document.getElementById(id);
-  const show = (id, value) => {
-    $(id).textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
-  };
   const request = (path, body = {}) => homebridge.request(path, body);
   const server = () => $("server").value || "de";
 
   $("qr-create").addEventListener("click", async () => {
-    show("qr-result", "Creating QR login...");
-    const res = await request("/create-micloud-qr-login", { server: server(), locale: "zh_CN" });
-    if (!res.success) {
-      show("qr-result", res);
-      return;
+    setStatus("qr-result", "info", "Creating Xiaomi QR login...");
+    try {
+      const res = await request("/create-micloud-qr-login", { server: server(), locale: "zh_CN" });
+      if (!res.success) {
+        setStatus("qr-result", "danger", "Could not create QR login", res.error);
+        return;
+      }
+      lp = res.lp;
+      $("qr-poll").disabled = false;
+      if (!renderExternalLink("qr-url", "qr-link", res.loginUrl || res.qr)) {
+        setStatus("qr-result", "danger", "Xiaomi returned an invalid login link.");
+        return;
+      }
+      setStatus("qr-result", "success", "QR login is ready", "Open the Xiaomi page, approve the login, then click Poll QR Login.");
+    } catch (error) {
+      setStatus("qr-result", "danger", "Could not create QR login", errorMessage(error));
     }
-    lp = res.lp;
-    $("qr-poll").disabled = false;
-    renderLoginLink(res.loginUrl || res.qr);
-    show("qr-result", res);
   });
 
   $("qr-poll").addEventListener("click", async () => {
     if (!lp) {
-      show("qr-result", "Create QR login first.");
+      setStatus("qr-result", "warning", "Create a QR login first.");
       return;
     }
-    const res = await request("/poll-micloud-qr-login", { server: server(), lp });
-    show("qr-result", res);
-    if (res.success) {
-      $("qr-poll").disabled = true;
-      await refreshSession();
+    try {
+      const res = await request("/poll-micloud-qr-login", { server: server(), lp });
+      if (res.success) {
+        $("qr-poll").disabled = true;
+        setStatus("qr-result", "success", "Xiaomi login completed.");
+        await refreshSession();
+      } else if (res.pending) {
+        setStatus("qr-result", "warning", "Waiting for Xiaomi approval", res.desc || "Approve the login in Xiaomi, then try again.");
+      } else {
+        setStatus("qr-result", "danger", "QR login failed", res.error || res.desc);
+      }
+    } catch (error) {
+      setStatus("qr-result", "danger", "QR login failed", errorMessage(error));
     }
   });
 
   $("password-login").addEventListener("click", async () => {
-    const res = await request("/login-to-micloud", {
-      server: server(),
-      username: $("username").value,
-      password: $("password").value,
-      verifyUrl: $("verify-url").value,
-      twoFaTicket: $("twofa-ticket").value,
-    });
-    if (res.url) {
-      $("verify-url").value = res.url;
-    }
-    show("session-status", res);
-    if (res.success) {
+    setStatus("login-status", "info", "Signing in to Xiaomi...");
+    try {
+      const res = await request("/login-to-micloud", {
+        server: server(),
+        username: $("username").value,
+        password: $("password").value,
+        verifyUrl: $("verify-url").value,
+        twoFaTicket: $("twofa-ticket").value,
+      });
+      if (res.url) {
+        if (!renderExternalLink("twofa-actions", "verify-link", res.url)) {
+          setStatus("login-status", "danger", "Xiaomi returned an invalid verification link.");
+          return;
+        }
+        $("verify-url").value = res.url;
+        $("password-login").textContent = "Continue with 2FA";
+        setStatus("login-status", "warning", "Two-factor authentication required", "Open the Xiaomi verification page, complete it, enter the ticket or code, then continue.");
+        return;
+      }
+      if (!res.success) {
+        setStatus("login-status", "danger", "Xiaomi sign-in failed", res.error);
+        return;
+      }
+      $("password").value = "";
+      $("twofa-ticket").value = "";
+      $("verify-url").value = "";
+      $("twofa-actions").hidden = true;
+      $("password-login").textContent = "Sign in";
+      setStatus("login-status", "success", "Xiaomi sign-in completed.");
       await refreshSession();
+    } catch (error) {
+      setStatus("login-status", "danger", "Xiaomi sign-in failed", errorMessage(error));
     }
   });
+
+  $("qr-copy").addEventListener("click", () => copyLink("qr-link", "qr-result"));
+  $("verify-copy").addEventListener("click", () => copyLink("verify-link", "login-status"));
 
   $("session-refresh").addEventListener("click", refreshSession);
   $("session-clear").addEventListener("click", async () => {
-    const res = await request("/clear-cached-micloud-session");
-    show("session-status", res);
+    if (!window.confirm("Clear the cached Xiaomi session? Local streaming will continue only while the cached MISS descriptor remains valid.")) {
+      return;
+    }
+    try {
+      const res = await request("/clear-cached-micloud-session");
+      if (res.success) {
+        setStatus("session-status", "success", "Cached Xiaomi session cleared.");
+      } else {
+        setStatus("session-status", "danger", "Could not clear the cached session", res.error);
+      }
+    } catch (error) {
+      setStatus("session-status", "danger", "Could not clear the cached session", errorMessage(error));
+    }
   });
 
   async function refreshSession() {
-    const res = await request("/get-cached-micloud-session");
-    show("session-status", res);
+    try {
+      const res = await request("/get-cached-micloud-session");
+      if (!res.success || !res.cachedSession?.ready) {
+        setStatus("session-status", "warning", "No usable Xiaomi session", "Sign in above before the plugin needs to create or refresh a MISS descriptor.");
+        return;
+      }
+      const details = [];
+      if (res.cachedSession.loginMethod) {
+        details.push(`Login method: ${humanize(res.cachedSession.loginMethod)}`);
+      }
+      if (res.cachedSession.loggedInAt) {
+        details.push(`Signed in: ${formatDate(res.cachedSession.loggedInAt)}`);
+      }
+      setStatus("session-status", "success", "Xiaomi session is ready", details.join(" · "));
+    } catch (error) {
+      setStatus("session-status", "danger", "Could not read the cached session", errorMessage(error));
+    }
   }
 
-  function renderLoginLink(value) {
-    const container = $("qr-url");
+  function renderExternalLink(containerId, linkId, value) {
+    const safeUrl = xiaomiUrl(value);
+    if (!safeUrl) {
+      return false;
+    }
+    $(linkId).href = safeUrl;
+    $(containerId).hidden = false;
+    return true;
+  }
+
+  function xiaomiUrl(value) {
+    try {
+      const url = new URL(value);
+      const host = url.hostname.toLowerCase();
+      return url.protocol === "https:" && (host === "xiaomi.com" || host.endsWith(".xiaomi.com"))
+        ? url.href
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function copyLink(linkId, statusId) {
+    const value = $(linkId).href;
+    try {
+      await navigator.clipboard.writeText(value);
+      setStatus(statusId, "success", "Xiaomi link copied.");
+    } catch (error) {
+      setStatus(statusId, "warning", "Could not copy the link", "Open it using the button instead.");
+    }
+  }
+
+  function setStatus(id, kind, title, detail = "") {
+    const container = $(id);
     container.textContent = "";
-    const prefix = document.createTextNode("Open or scan: ");
-    const link = document.createElement("a");
-    link.href = value;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-    link.textContent = value;
-    container.appendChild(prefix);
-    container.appendChild(link);
+    container.className = `alert alert-${kind} mt-3`;
+    const heading = document.createElement("strong");
+    heading.textContent = title;
+    container.appendChild(heading);
+    if (detail) {
+      const text = document.createElement("div");
+      text.className = "mt-1";
+      text.textContent = detail;
+      container.appendChild(text);
+    }
+    container.hidden = false;
+  }
+
+  function errorMessage(error) {
+    return error?.message || String(error || "Unknown error");
+  }
+
+  function humanize(value) {
+    return String(value).replaceAll("_", " ");
+  }
+
+  function formatDate(value) {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
   }
 
   async function loadConfigForm() {
@@ -153,7 +269,7 @@
     });
   }
 
-  refreshSession().catch((error) => show("session-status", error.message || String(error)));
-  loadConfigForm().catch((error) => show("session-status", error.message || String(error)));
+  refreshSession();
+  loadConfigForm().catch((error) => setStatus("session-status", "danger", "Could not load plugin configuration", errorMessage(error)));
 })();
 </script>

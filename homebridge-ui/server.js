@@ -180,15 +180,9 @@ class UiServer extends HomebridgePluginUiServer {
       return null;
     }
     return {
-      userId: session.userId ? String(session.userId) : undefined,
+      ready: Boolean(session.ssecurity && session.serviceToken && session.agentId && session.clientId),
       loggedInAt: session.loggedInAt,
-      timestamp: session.timestamp,
       loginMethod: session.loginMethod,
-      hasSsecurity: Boolean(session.ssecurity),
-      hasServiceToken: Boolean(session.serviceToken),
-      hasAgentId: Boolean(session.agentId),
-      hasClientId: Boolean(session.clientId),
-      file: this.sessionFile(),
     };
   }
 }

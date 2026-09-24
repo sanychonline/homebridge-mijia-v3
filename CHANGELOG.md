@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.14
+
+### Homebridge UI
+
+- Present Xiaomi verification URLs as validated, clickable buttons instead of raw text fields or JSON output.
+- Add a copy-link fallback and clear instructions for completing Xiaomi password/2FA and QR login.
+- Replace cached-session JSON with human-readable ready, missing, cleared, and error states.
+- Stop exposing internal session file paths, account identifiers, and token-presence flags in the settings screen.
+- Ask for confirmation before clearing the cached Xiaomi session.
+
 ## 0.1.13
 
 ### MISS authentication recovery
