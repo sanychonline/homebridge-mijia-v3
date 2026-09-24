@@ -473,6 +473,8 @@ class XiaomiCameraStreamingDelegate {
       return;
     }
 
+    clearTimeout(this.backgroundResumeTimer);
+    this.backgroundResumeTimer = null;
     this.backgroundPausedForMain += 1;
     if (this.backgroundPausedForMain > 1) {
       return;
@@ -496,8 +498,25 @@ class XiaomiCameraStreamingDelegate {
       return;
     }
 
-    this.platform.log.info(`Resuming SUB monitoring after MAIN stream ended for ${this.config.name || this.config.did}: reason=${reason}`);
-    this.monitoringService.start();
+    const delayMs = Math.max(Number(this.config.backgroundMonitoringResumeDelayMs ?? 3000), 0);
+    const resume = () => {
+      this.backgroundResumeTimer = null;
+      if (this.backgroundPausedForMain > 0) {
+        return;
+      }
+      this.platform.log.info(`Resuming SUB monitoring after MAIN stream ended for ${this.config.name || this.config.did}: reason=${reason}`);
+      this.monitoringService.start();
+    };
+
+    clearTimeout(this.backgroundResumeTimer);
+    if (delayMs === 0) {
+      resume();
+      return;
+    }
+
+    this.platform.log.debug(`Scheduling SUB monitoring after MAIN reader shutdown for ${this.config.name || this.config.did}: reason=${reason}, delayMs=${delayMs}`);
+    this.backgroundResumeTimer = setTimeout(resume, delayMs);
+    this.backgroundResumeTimer.unref?.();
   }
 
   closeIdleSharedReaderForQuality(videoQuality, reason) {
