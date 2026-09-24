@@ -5,7 +5,7 @@
 - Explain that `did` is the numeric Xiaomi/Mi Home database device ID and distinguish it from the IP address, MAC address, serial number, and device key.
 - Rename the Homebridge field to **Xiaomi Device ID (DID)** and add the same explanation directly to the configuration form.
 
-## 0.1.14
+## 0.1.14 - 2026-09-24
 
 ### Homebridge UI
 
@@ -18,7 +18,7 @@
 - Hide MISS descriptor source and local diagnostics internals from the normal configuration form.
 - Automatically refresh missing or rejected MISS descriptors through the cached Xiaomi session, including installations that retain the old strict-local setting.
 
-## 0.1.13
+## 0.1.13 - 2026-09-23
 
 ### MISS authentication recovery
 
@@ -28,7 +28,7 @@
 - Close a failed TUTK reader before retrying to avoid leaving rejected connections behind.
 - Preserve strict local behavior: `cloudBootstrap: "local"` never contacts Xiaomi and reports the exact recovery action required.
 
-## 0.1.12
+## 0.1.12 - 2026-09-14
 
 Prepared for npm publication. This release consolidates the local HSV event-continuity and recording-input fixes without changing the established Live encoding path.
 
@@ -58,7 +58,7 @@ Prepared for npm publication. This release consolidates the local HSV event-cont
 - An approximately 1.2-second difference in measured audio/video timeline durations remains under investigation; that measurement alone does not establish perceived audio/video sync.
 - Transport, event-continuity, and FFmpeg tests supplement, rather than replace, end-to-end Apple Home playback checks.
 
-## 0.1.11
+## 0.1.11 - 2026-09-14
 
 Prepared for npm publication. This release consolidates the locally developed camera streaming improvements.
 
@@ -89,3 +89,91 @@ Prepared for npm publication. This release consolidates the locally developed ca
 - A previously reported intermittent audio startup delay was not reproduced in the final cold-start checks; its cause was not established. Startup timing is not guaranteed for every network or device.
 - Historical audio is not retained for the entire video prebuffer; recording preroll may contain silence.
 - No new camera model compatibility is claimed by this release.
+
+## 0.1.10 - 2026-09-14
+
+### Faster Live View startup
+
+- Start HomeKit Live View from the already available SUB stream while the MAIN stream is being prepared.
+- Switch the active session to MAIN video after it becomes available instead of making HomeKit wait for a cold MAIN connection.
+- Keep the camera accessory and streaming delegate coordinated during the source transition.
+
+## 0.1.9 - 2026-09-14
+
+### Stability rollback
+
+- Disable automatic Live reader preconnection by default after testing showed that permanent preconnection could cause missing frames and periodic stalls.
+- Keep the optimization available internally without imposing its resource cost on normal installations.
+
+## 0.1.8 - 2026-09-14
+
+### Connection lifecycle
+
+- Restore the short idle timeout for unused camera readers.
+- Release inactive camera resources promptly instead of retaining connections for an extended period.
+
+## 0.1.7 - 2026-09-14
+
+### Faster repeated viewing
+
+- Keep a recently used Live reader warm for a limited period after HomeKit closes a stream.
+- Reduce startup delay when the camera is reopened shortly after the previous viewer disconnects.
+
+## 0.1.6 - 2026-09-14
+
+### Live reader preparation
+
+- Begin connecting the camera reader during HomeKit stream preparation rather than waiting for the final start request.
+- Add configuration defaults for the preconnection experiment used to reduce cold-start latency.
+
+## 0.1.5 - 2026-09-14
+
+### Motion detection
+
+- Raise the default changed-area threshold to reduce false motion events, especially from night/IR noise and small brightness fluctuations.
+- Document the adjusted default for local video-based motion analysis.
+
+## 0.1.4 - 2026-09-13
+
+### Still images
+
+- Generate HomeKit still images from the active local video prebuffer when frames are already available.
+- Avoid opening an additional camera session solely for a snapshot.
+
+## 0.1.3 - 2026-09-13
+
+### Resource usage
+
+- Disable continuous MAIN-stream prebuffering by default.
+- Keep the lower-bandwidth SUB stream as the normal background source to reduce camera, network, and Homebridge load.
+- Allow MAIN prebuffering to remain an explicit opt-in for installations that accept the additional resource use.
+
+## 0.1.2 - 2026-09-13
+
+### HomeKit Secure Video state
+
+- Report inactive HSV recording states clearly instead of treating a normal disabled or unavailable state as an unexplained recording failure.
+- Improve recording delegate cleanup when HomeKit is not actively requesting a recording.
+
+## 0.1.1 - 2026-09-13
+
+### Xiaomi connection bootstrap
+
+- Use the cached Xiaomi account session to obtain and store a missing MISS descriptor.
+- Allow a new installation to recover automatically instead of requiring a manually prepared descriptor file.
+- Keep normal camera media transport local after bootstrap.
+
+## 0.1.0 - 2026-09-13
+
+### Initial release
+
+- Add the `Xiaomi Camera 1080P` Homebridge platform for `mijia.camera.v3`.
+- Implement native local Xiaomi MISS/TUTK connectivity.
+- Read H.264 video and PCMA camera audio directly from the camera.
+- Provide HomeKit Live View, still images, camera audio, and concurrent viewer support.
+- Add two-way talkback from HomeKit to the camera.
+- Add low-bandwidth SUB-stream monitoring and local motion detection.
+- Add MAIN-stream HomeKit Secure Video recording with encoded prebuffer support.
+- Add camera power/privacy control and an optional HomeKit switch.
+- Add Xiaomi session bootstrap and local MISS descriptor caching.
+- Add Homebridge custom UI, configuration schema, diagnostics, security guidance, and initial transport/audio tests.
