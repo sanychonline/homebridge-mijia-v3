@@ -26,3 +26,7 @@ last-hsv-video.h264
 .env
 .env.*
 micloudlogin.json
+
+# Local npm release artifacts
+.npm-cache/
+*.tgz
